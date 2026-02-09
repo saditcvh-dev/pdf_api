@@ -37,11 +37,13 @@ def process_pdf_task(self, pdf_id: str, pdf_path: str, use_ocr: bool = True):
         command = [
             "ocrmypdf",
             "-l", "spa",
+            "--force-ocr",
+            "--tagged-pdf-mode", "ignore",
             "--optimize", "0",
             "--output-type", "pdf",
             "--jpeg-quality", "100",
             "--max-image-mpixels", "1000",
-            "--jobs", "1",
+            "--jobs", "8",
             pdf_path,
             ocr_pdf_path
         ]
@@ -94,7 +96,7 @@ def process_pdf_task(self, pdf_id: str, pdf_path: str, use_ocr: bool = True):
 
         # Puedes cambiar a ocr_pdf_path si prefieres extraer del resultado OCR
         text, pages, used_ocr = pdf_service.extract_text_from_pdf(
-            pdf_path, use_ocr=use_ocr
+            ocr_pdf_path, use_ocr=False
         )
 
         logger.info(f"[ÉXITO] Texto extraído: {len(text):,} caracteres | {pages} páginas | OCR usado: {used_ocr}")
