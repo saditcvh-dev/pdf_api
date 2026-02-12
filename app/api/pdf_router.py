@@ -864,3 +864,8 @@ async def get_ocr_result(pdf_id: str):
         "download_pdf": f"/api/pdf/{pdf_id}/searchable-pdf",
         "download_text": f"/api/pdf/{pdf_id}/text"
     }
+
+
+
+
+
