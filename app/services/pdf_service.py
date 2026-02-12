@@ -402,10 +402,43 @@ class PDFService:
         logger.info(f"PDF con OCRmyPDF GUARDADO: {filepath}")
         
         return str(filepath)
-    def get_pdf_pages_count(self, file_bytes: bytes) -> int:
+
+    def merge_pdfs(self, pdf_paths: List[str], output_path: str, position: str = 'end') -> str:
         """
-        Obtiene el número de páginas de un PDF sin guardarlo en disco
-        y sin usar OCR.
+        Une una lista de PDFs en un único archivo de salida usando PyMuPDF.
+        position: 'end' para anexar cada documento al final del acumulado,
+                  'start' para insertarlos al inicio (comportamiento original).
+        Devuelve la ruta del PDF resultante.
         """
-        reader = PdfReader(BytesIO(file_bytes))
-        return len(reader.pages)
+        try:
+            if not pdf_paths:
+                raise ValueError("No se proporcionaron PDFs para unir")
+
+            out_path = Path(output_path)
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+
+            # Abrir el primer documento como base
+            merged = fitz.open(pdf_paths[0])
+
+            for p in pdf_paths[1:]:
+                if not os.path.exists(p):
+                    logger.warning(f"Archivo a unir no encontrado: {p}")
+                    continue
+                src = fitz.open(p)
+                if position == 'end':
+                    # Insertar al final
+                    merged.insert_pdf(src, start_at=len(merged))
+                else:
+                    # Insertar al inicio (comportamiento por defecto)
+                    merged.insert_pdf(src, start_at=0)
+                src.close()
+
+            merged.save(str(out_path))
+            merged.close()
+
+            logger.info(f"PDFs unidos en: {out_path}")
+            return str(out_path)
+
+        except Exception as e:
+            logger.exception(f"Error al unir PDFs: {e}")
+            raise

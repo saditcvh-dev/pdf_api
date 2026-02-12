@@ -23,6 +23,8 @@ from app.core.celery_app import celery_app
 from app.core.state import pdf_storage, pdf_task_status
 import logging
 import threading
+import subprocess
+import shutil
 
 pdf_storage = {}
 pdf_task_status = {}  # ← esto sobra y causa conflicto
@@ -364,6 +366,114 @@ async def get_searchable_pdf(pdf_id: str):
         media_type="application/pdf",
         filename=f"{pdf_id}_searchable.pdf"
     )
+
+
+@router.post("/merge-with-output")
+async def merge_with_output(
+    first_pdf_id: str = Query(..., description="ID del PDF ya procesado en outputs"),
+    file: UploadFile = File(...),
+    use_ocr: bool = Query(True),
+    position: str = Query("end", description="Dónde insertar el segundo PDF: 'start' o 'end'")
+):
+    """
+    Recibe un PDF ya procesado (referido por `first_pdf_id` en outputs) y un segundo PDF sin procesar.
+    Procesa el segundo con OCRmyPDF, guarda sus textos y luego une ambos PDFs en `outputs`.
+    Devuelve el PDF combinado.
+    """
+    try:
+        # Verificar que el primer PDF procesado exista en outputs
+        first_path = os.path.join(settings.OUTPUTS_FOLDER, f"{first_pdf_id}.pdf")
+        if not os.path.exists(first_path):
+            raise HTTPException(status_code=404, detail="Primer PDF procesado no encontrado en outputs")
+
+        # Guardar el segundo PDF temporalmente
+        file_bytes = await file.read()
+        second_id = pdf_service.generate_pdf_id(file.filename, file_bytes)
+        uploads_dir = settings.UPLOAD_FOLDER
+        os.makedirs(uploads_dir, exist_ok=True)
+        second_path = os.path.join(uploads_dir, f"{second_id}.pdf")
+        with open(second_path, "wb") as f:
+            f.write(file_bytes)
+
+        # Aplicar OCR al segundo PDF (sin Celery, síncrono) usando ocrmypdf
+        os.makedirs(settings.OUTPUTS_FOLDER, exist_ok=True)
+        ocr_second_output = os.path.join(settings.OUTPUTS_FOLDER, f"{second_id}.pdf")
+
+        command = [
+            "ocrmypdf",
+            "-l", "spa",
+            "--force-ocr",
+            "--optimize", "0",
+            "--output-type", "pdf",
+            "--jpeg-quality", "100",
+            second_path,
+            ocr_second_output
+        ]
+
+        result = subprocess.run(command, capture_output=True, text=True, check=False)
+        if result.returncode != 0 or not os.path.exists(ocr_second_output):
+            # limpiar temporal
+            if os.path.exists(second_path):
+                os.remove(second_path)
+            raise HTTPException(status_code=500, detail=f"OCRmyPDF falló: {result.stderr.strip()}")
+
+        # Extraer texto del segundo y guardar
+        text, pages, used_ocr = pdf_service.extract_text_from_pdf(second_path, use_ocr=use_ocr)
+        text_path = pdf_service.save_extracted_text(text, second_id)
+
+        # Actualizar metadatos en memoria
+        now = datetime.now()
+        pdf_storage[second_id] = {
+            'filename': file.filename,
+            'pdf_path': second_path,
+            'size': len(file_bytes),
+            'upload_time': time.time(),
+            'task_id': None,
+            'use_ocr': use_ocr,
+            'pages': pages,
+            'text_path': text_path
+        }
+        pdf_task_status[second_id] = {
+            'task_id': None,
+            'status': 'completed',
+            'created_at': now,
+            'completed_at': datetime.now(),
+            'pages': pages,
+            'extracted_text_path': text_path,
+            'ocr_pdf_path': ocr_second_output,
+            'used_ocr': used_ocr,
+            'text_length': len(text)
+        }
+
+        # Unir PDFs (primero procesado + segundo procesado)
+        merged_id = f"{first_pdf_id}_{second_id}_merged"
+        merged_output = os.path.join(settings.OUTPUTS_FOLDER, f"{merged_id}.pdf")
+        merged_path = pdf_service.merge_pdfs([first_path, ocr_second_output], merged_output, position=position)
+
+        # Guardar metadatos del PDF combinado
+        pdf_storage[merged_id] = {
+            'filename': f"{merged_id}.pdf",
+            'pdf_path': merged_path,
+            'size': os.path.getsize(merged_path),
+            'upload_time': time.time()
+        }
+        pdf_task_status[merged_id] = {
+            'task_id': None,
+            'status': 'completed',
+            'created_at': now,
+            'completed_at': datetime.now(),
+            'pages': (pdf_task_status.get(first_pdf_id, {}).get('pages') or 0) + pages,
+            'extracted_text_path': None,
+            'ocr_pdf_path': merged_path,
+            'used_ocr': True
+        }
+
+        return FileResponse(merged_path, media_type="application/pdf", filename=f"{merged_id}.pdf")
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error en merge: {str(e)}")
 
 @router.get("/{pdf_id}/info", response_model=PDFInfo)
 async def get_pdf_info(pdf_id: str):
