@@ -381,8 +381,36 @@ async def merge_with_output(
     Devuelve el PDF combinado.
     """
     try:
-        # Verificar que el primer PDF procesado exista en outputs
-        first_path = os.path.join(settings.OUTPUTS_FOLDER, f"{first_pdf_id}.pdf")
+        # Verificar que el primer PDF procesado exista en outputs para desarrolllo ---Versoon para windows 
+        # first_path = os.path.join(settings.OUTPUTS_FOLDER, f"{first_pdf_id}.pdf")
+        # Extraer partes del ID
+        parts = first_pdf_id.split("_")
+
+        # Base sin versión ni timestamp
+        # 9982_03_11_01_033_C_v6_1770679762097
+        # -> 9982_03_11_01_033_C
+        base_id = "_".join(parts[:6])
+
+        # Segmentos para carpetas
+        # 03 y 01
+        folder_1 = parts[1]
+        folder_2 = parts[3]
+
+        # Ruta real en producción
+        first_path = os.path.join(
+            "/data/docs",
+            folder_1,
+            folder_2,
+            base_id,
+            f"{first_pdf_id}.pdf"
+        )
+
+        if not os.path.exists(first_path):
+            raise HTTPException(
+                status_code=404,
+                detail=f"PDF no encontrado en producción: {first_path}"
+            )
+
         if not os.path.exists(first_path):
             raise HTTPException(status_code=404, detail="Primer PDF procesado no encontrado en outputs")
 
