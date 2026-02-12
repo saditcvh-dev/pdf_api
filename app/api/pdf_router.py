@@ -25,12 +25,6 @@ import logging
 import threading
 import subprocess
 import shutil
-# from fastapi import APIRouter, UploadFile, File, Query, HTTPException
-# import os
-
-router = APIRouter()
-
-BASE_DOCS_PATH = "/data/docs"
 
 pdf_storage = {}
 pdf_task_status = {}  # ← esto sobra y causa conflicto
@@ -390,33 +384,35 @@ async def merge_with_output(
         # Verificar que el primer PDF procesado exista en outputs para desarrolllo ---Versoon para windows 
         # first_path = os.path.join(settings.OUTPUTS_FOLDER, f"{first_pdf_id}.pdf")
         # Extraer partes del ID
-            #  Normalizar la ruta para evitar path traversal (../../ etc)
-        normalized_path = os.path.normpath(first_pdf_id)
+        parts = first_pdf_id.split("_")
 
-        # Evitar que intenten salir de /data/docs
-        if normalized_path.startswith("..") or os.path.isabs(normalized_path):
-            raise HTTPException(
-                status_code=400,
-                detail="Ruta inválida"
-            )
+        # Base sin versión ni timestamp
+        # 9982_03_11_01_033_C_v6_1770679762097
+        # -> 9982_03_11_01_033_C
+        base_id = "_".join(parts[:6])
 
-        # Construir ruta absoluta real
-        first_path = os.path.join(BASE_DOCS_PATH, normalized_path)
+        # Segmentos para carpetas
+        # 03 y 01
+        folder_1 = parts[1]
+        folder_2 = parts[3]
 
-        # Validar que realmente esté dentro de /data/docs
-        if not os.path.commonpath([first_path, BASE_DOCS_PATH]) == BASE_DOCS_PATH:
-            raise HTTPException(
-                status_code=400,
-                detail="Ruta fuera del directorio permitido"
-            )
+        # Ruta real en producción
+        first_path = os.path.join(
+            "/data/docs",
+            folder_1,
+            folder_2,
+            base_id,
+            f"{first_pdf_id}.pdf"
+        )
 
-        # Verificar existencia
         if not os.path.exists(first_path):
             raise HTTPException(
                 status_code=404,
                 detail=f"PDF no encontrado en producción: {first_path}"
             )
 
+        if not os.path.exists(first_path):
+            raise HTTPException(status_code=404, detail="Primer PDF procesado no encontrado en outputs")
 
         # Guardar el segundo PDF temporalmente
         file_bytes = await file.read()
