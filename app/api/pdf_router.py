@@ -25,6 +25,12 @@ import logging
 import threading
 import subprocess
 import shutil
+# from fastapi import APIRouter, UploadFile, File, Query, HTTPException
+# import os
+
+router = APIRouter()
+
+BASE_DOCS_PATH = "/data/docs"
 
 pdf_storage = {}
 pdf_task_status = {}  # ← esto sobra y causa conflicto
@@ -384,22 +390,33 @@ async def merge_with_output(
         # Verificar que el primer PDF procesado exista en outputs para desarrolllo ---Versoon para windows 
         # first_path = os.path.join(settings.OUTPUTS_FOLDER, f"{first_pdf_id}.pdf")
         # Extraer partes del ID
-        normalized_path = first_pdf_id.replace("\\", "/")
+            #  Normalizar la ruta para evitar path traversal (../../ etc)
+        normalized_path = os.path.normpath(first_pdf_id)
 
-        # Construir ruta absoluta en producción
-        first_path = os.path.join("/data/docs", normalized_path)
+        # Evitar que intenten salir de /data/docs
+        if normalized_path.startswith("..") or os.path.isabs(normalized_path):
+            raise HTTPException(
+                status_code=400,
+                detail="Ruta inválida"
+            )
 
-        #  Normalizar por seguridad
-        first_path = os.path.normpath(first_path)
+        # Construir ruta absoluta real
+        first_path = os.path.join(BASE_DOCS_PATH, normalized_path)
 
+        # Validar que realmente esté dentro de /data/docs
+        if not os.path.commonpath([first_path, BASE_DOCS_PATH]) == BASE_DOCS_PATH:
+            raise HTTPException(
+                status_code=400,
+                detail="Ruta fuera del directorio permitido"
+            )
+
+        # Verificar existencia
         if not os.path.exists(first_path):
             raise HTTPException(
                 status_code=404,
                 detail=f"PDF no encontrado en producción: {first_path}"
             )
 
-        if not os.path.exists(first_path):
-            raise HTTPException(status_code=404, detail="Primer PDF procesado no encontrado en outputs")
 
         # Guardar el segundo PDF temporalmente
         file_bytes = await file.read()
