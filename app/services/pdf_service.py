@@ -442,3 +442,11 @@ class PDFService:
         except Exception as e:
             logger.exception(f"Error al unir PDFs: {e}")
             raise
+
+    def get_pdf_pages_count(self, file_bytes: bytes) -> int:
+        """
+        Obtiene el número de páginas de un PDF sin guardarlo en disco
+        y sin usar OCR.
+        """
+        reader = PdfReader(BytesIO(file_bytes))
+        return len(reader.pages)
