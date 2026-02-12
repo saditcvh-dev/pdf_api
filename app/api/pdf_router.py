@@ -384,26 +384,24 @@ async def merge_with_output(
         # Verificar que el primer PDF procesado exista en outputs para desarrolllo ---Versoon para windows 
         # first_path = os.path.join(settings.OUTPUTS_FOLDER, f"{first_pdf_id}.pdf")
         # Extraer partes del ID
-        parts = first_pdf_id.split("_")
+        # first_pdf_id ahora viene como ruta relativa:
+        # 01/01/5555_01_11_03_999_C/archivo.pdf
 
-        # Base sin versión ni timestamp
-        # 9982_03_11_01_033_C_v6_1770679762097
-        # -> 9982_03_11_01_033_C
-        base_id = "_".join(parts[:6])
+        first_path = os.path.join("/data/docs", first_pdf_id)
 
-        # Segmentos para carpetas
-        # 03 y 01
-        folder_1 = parts[1]
-        folder_2 = parts[3]
+        # Normalizar la ruta por seguridad
+        first_path = os.path.abspath(first_path)
 
-        # Ruta real en producción
-        first_path = os.path.join(
-            "/data/docs",
-            folder_1,
-            folder_2,
-            base_id,
-            f"{first_pdf_id}.pdf"
-        )
+        # Validar que realmente esté dentro de /data/docs
+        if not first_path.startswith("/data/docs"):
+            raise HTTPException(status_code=400, detail="Ruta inválida")
+
+        if not os.path.exists(first_path):
+            raise HTTPException(
+                status_code=404,
+                detail=f"PDF no encontrado: {first_path}"
+            )
+
 
         if not os.path.exists(first_path):
             raise HTTPException(
@@ -474,10 +472,12 @@ async def merge_with_output(
         }
 
         # Unir PDFs (primero procesado + segundo procesado)
-        merged_id = f"{first_pdf_id}_{second_id}_merged"
-        merged_output = os.path.join(settings.OUTPUTS_FOLDER, f"{merged_id}.pdf")
+        # merged_id = f"{first_pdf_id}_{second_id}_merged"
+        merged_id = f"{first_pdf_id.replace('/', '_')}_{second_id}_merged"
+        merged_output = os.path.join(settings.OUTPUTS_FOLDER,f"{merged_id}.pdf")
+        # merged_output = os.path.join(settings.OUTPUTS_FOLDER, f"{merged_id}.pdf")
         merged_path = pdf_service.merge_pdfs([first_path, ocr_second_output], merged_output, position=position)
-
+    
         # Guardar metadatos del PDF combinado
         pdf_storage[merged_id] = {
             'filename': f"{merged_id}.pdf",
