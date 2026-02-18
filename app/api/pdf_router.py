@@ -38,6 +38,63 @@ router = APIRouter(prefix="/api/pdf", tags=["pdf"])
 pdf_service = PDFService()
 
 
+def load_existing_pdfs():
+    """Carga PDFs desde las carpetas configuradas en `settings`.
+    Esta función puede llamarse al inicio para poblar `pdf_storage` y `pdf_task_status`.
+    """
+    uploads_dir = Path(settings.UPLOAD_FOLDER)
+    extracted_dir = Path(settings.EXTRACTED_FOLDER)
+    outputs_dir = Path(settings.OUTPUTS_FOLDER)
+
+    if not uploads_dir.exists():
+        return
+
+    for pdf_file in uploads_dir.glob("*.pdf"):
+        pdf_id = pdf_file.stem
+
+        # Solo agregar si no existe
+        if pdf_id not in pdf_storage:
+            # timestamp de la modificación del archivo
+            upload_time_ts = pdf_file.stat().st_mtime
+
+            pdf_storage[pdf_id] = {
+                'filename': pdf_file.name,
+                'size': pdf_file.stat().st_size,
+                'upload_time': upload_time_ts,  # TIMESTAMP
+                'pdf_path': str(pdf_file)
+            }
+
+            # Determinar estado basado en archivos en carpetas configuradas
+            txt_path = extracted_dir / f"{pdf_id}.txt"
+            output_pdf_path = outputs_dir / f"{pdf_id}.pdf"
+
+            created_at_ts = upload_time_ts
+
+            if txt_path.exists() or output_pdf_path.exists():
+                # Usar timestamp de modificación del txt o output
+                completed_at_ts = txt_path.stat().st_mtime if txt_path.exists() else output_pdf_path.stat().st_mtime
+
+                pdf_task_status[pdf_id] = {
+                    'status': 'completed',
+                    'created_at': created_at_ts,
+                    'completed_at': completed_at_ts,
+                    'used_ocr': output_pdf_path.exists(),
+                    'extracted_text_path': str(txt_path) if txt_path.exists() else None,
+                    'ocr_pdf_path': str(output_pdf_path) if output_pdf_path.exists() else None,
+                    'task_id': None
+                }
+            else:
+                # PDF subido pero no procesado
+                pdf_task_status[pdf_id] = {
+                    'status': 'unknown',
+                    'created_at': created_at_ts,
+                    'task_id': None
+                }
+
+# Cargar al inicio del módulo para que la lista muestre archivos existentes tras reinicios
+load_existing_pdfs()
+
+
 @router.post("/upload", response_model=PDFUploadResponse)
 async def upload_pdf(file: UploadFile = File(...), use_ocr: bool = Query(True)):
     """Sube un PDF a la cola de procesamiento sin esperar a que se procese"""
@@ -531,57 +588,6 @@ async def list_pdfs():
     Devuelve la lista de todos los PDFs con su estado de procesamiento.
     Útil para ver qué PDFs están en cola, en proceso o completados.
     """
-    # ========== AGREGAR: Cargar PDFs existentes en disco ==========
-    def load_existing_pdfs():
-        uploads_dir = Path("uploads")
-        if not uploads_dir.exists():
-            return
-            
-        for pdf_file in uploads_dir.glob("*.pdf"):
-            pdf_id = pdf_file.stem
-            
-            # Solo agregar si no existe
-            if pdf_id not in pdf_storage:
-                # Convertir datetime a timestamp (float) para Pydantic
-                upload_time_dt = datetime.fromtimestamp(pdf_file.stat().st_mtime)
-                upload_time_ts = upload_time_dt.timestamp()
-                
-                pdf_storage[pdf_id] = {
-                    'filename': pdf_file.name,
-                    'size': pdf_file.stat().st_size,
-                    'upload_time': upload_time_ts  # TIMESTAMP en lugar de datetime
-                }
-                
-                # Determinar estado basado en archivos
-                txt_path = Path("extracted_texts") / f"{pdf_id}.txt"
-                output_pdf_path = Path("outputs") / f"{pdf_id}.pdf"
-                
-                # Convertir datetime a timestamp para created_at y completed_at
-                created_at_dt = datetime.fromtimestamp(pdf_file.stat().st_mtime)
-                created_at_ts = created_at_dt.timestamp()
-                
-                if txt_path.exists() or output_pdf_path.exists():
-                    # Usar timestamp de modificación del txt o output
-                    if txt_path.exists():
-                        completed_at_ts = txt_path.stat().st_mtime
-                    else:
-                        completed_at_ts = output_pdf_path.stat().st_mtime
-                    
-                    pdf_task_status[pdf_id] = {
-                        'status': 'completed',
-                        'created_at': created_at_ts,  # TIMESTAMP
-                        'completed_at': completed_at_ts,  # TIMESTAMP
-                        'used_ocr': output_pdf_path.exists(),
-                        'extracted_text_path': str(txt_path) if txt_path.exists() else None
-                    }
-                else:
-                    # PDF subido pero no procesado
-                    pdf_task_status[pdf_id] = {
-                        'status': 'unknown',
-                        'created_at': created_at_ts  # TIMESTAMP
-                    }
-    # ========== FIN DE LA PARTE AGREGADA ==========
-    
     # Llamar a la función para cargar PDFs existentes
     load_existing_pdfs()
     # Filtrar solo los archivos que cumplen la nomenclatura obligatoria
