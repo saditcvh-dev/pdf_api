@@ -105,8 +105,7 @@ def load_existing_pdfs():
             except Exception as e:
                 logger.exception(f"Error cargando PDF {pdf_file}: {e}")
 
-# Cargar al inicio del módulo para que la lista muestre archivos existentes tras reinicios
-load_existing_pdfs()
+# Nota: la carga se realizará desde el evento de startup de la aplicación
 
 
 @router.post("/upload", response_model=PDFUploadResponse)

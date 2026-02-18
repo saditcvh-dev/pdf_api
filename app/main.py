@@ -110,8 +110,15 @@ def load_existing_pdfs_at_startup():
     logger.info(f"Restauración completada: {loaded} PDFs cargados desde disco")
 
 
-# Ejecutar la carga al iniciar la aplicación
-load_existing_pdfs_at_startup()
+@app.on_event("startup")
+def startup_load_pdfs():
+    # Preferir la función de `pdf_router` que escanea uploads/outputs recursivamente
+    try:
+        logger.info("Startup: cargando PDFs desde disco mediante pdf_router.load_existing_pdfs()")
+        pdf_router.load_existing_pdfs()
+        logger.info(f"Startup: pdf_storage contiene {len(pdf_storage)} entradas tras restauración")
+    except Exception as e:
+        logger.exception(f"Error cargando PDFs en startup: {e}")
 
 @app.get("/")
 async def root():
