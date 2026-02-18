@@ -46,50 +46,65 @@ def load_existing_pdfs():
     extracted_dir = Path(settings.EXTRACTED_FOLDER)
     outputs_dir = Path(settings.OUTPUTS_FOLDER)
 
-    if not uploads_dir.exists():
+    # Buscar en uploads y outputs, recursivamente, para cubrir distintos flujos
+    search_dirs = []
+    if uploads_dir.exists():
+        search_dirs.append(uploads_dir)
+    if outputs_dir.exists():
+        search_dirs.append(outputs_dir)
+
+    if not search_dirs:
+        logger.info("No se encontraron carpetas uploads/outputs existentes para escanear.")
         return
 
-    for pdf_file in uploads_dir.glob("*.pdf"):
-        pdf_id = pdf_file.stem
+    for base in search_dirs:
+        for pdf_file in base.rglob("*.pdf"):
+            try:
+                pdf_id = pdf_file.stem
 
-        # Solo agregar si no existe
-        if pdf_id not in pdf_storage:
-            # timestamp de la modificación del archivo
-            upload_time_ts = pdf_file.stat().st_mtime
+                # Evitar procesar archivos temporales o nombres vacíos
+                if not pdf_id or pdf_id.startswith("."):
+                    continue
 
-            pdf_storage[pdf_id] = {
-                'filename': pdf_file.name,
-                'size': pdf_file.stat().st_size,
-                'upload_time': upload_time_ts,  # TIMESTAMP
-                'pdf_path': str(pdf_file)
-            }
+                # Solo agregar si no existe
+                if pdf_id in pdf_storage:
+                    continue
 
-            # Determinar estado basado en archivos en carpetas configuradas
-            txt_path = extracted_dir / f"{pdf_id}.txt"
-            output_pdf_path = outputs_dir / f"{pdf_id}.pdf"
+                upload_time_ts = pdf_file.stat().st_mtime
 
-            created_at_ts = upload_time_ts
-
-            if txt_path.exists() or output_pdf_path.exists():
-                # Usar timestamp de modificación del txt o output
-                completed_at_ts = txt_path.stat().st_mtime if txt_path.exists() else output_pdf_path.stat().st_mtime
-
-                pdf_task_status[pdf_id] = {
-                    'status': 'completed',
-                    'created_at': created_at_ts,
-                    'completed_at': completed_at_ts,
-                    'used_ocr': output_pdf_path.exists(),
-                    'extracted_text_path': str(txt_path) if txt_path.exists() else None,
-                    'ocr_pdf_path': str(output_pdf_path) if output_pdf_path.exists() else None,
-                    'task_id': None
+                pdf_storage[pdf_id] = {
+                    'filename': pdf_file.name,
+                    'size': pdf_file.stat().st_size,
+                    'upload_time': upload_time_ts,
+                    'pdf_path': str(pdf_file)
                 }
-            else:
-                # PDF subido pero no procesado
-                pdf_task_status[pdf_id] = {
-                    'status': 'unknown',
-                    'created_at': created_at_ts,
-                    'task_id': None
-                }
+
+                # Determinar estado por existencia de texto extraído u output
+                txt_path = extracted_dir / f"{pdf_id}.txt"
+                output_pdf_path = outputs_dir / f"{pdf_id}.pdf"
+
+                created_at_ts = upload_time_ts
+
+                if txt_path.exists() or output_pdf_path.exists():
+                    completed_at_ts = txt_path.stat().st_mtime if txt_path.exists() else output_pdf_path.stat().st_mtime
+                    pdf_task_status[pdf_id] = {
+                        'status': 'completed',
+                        'created_at': created_at_ts,
+                        'completed_at': completed_at_ts,
+                        'used_ocr': output_pdf_path.exists(),
+                        'extracted_text_path': str(txt_path) if txt_path.exists() else None,
+                        'ocr_pdf_path': str(output_pdf_path) if output_pdf_path.exists() else None,
+                        'task_id': None
+                    }
+                else:
+                    pdf_task_status[pdf_id] = {
+                        'status': 'unknown',
+                        'created_at': created_at_ts,
+                        'task_id': None
+                    }
+                logger.info(f"Cargado PDF desde disco: {pdf_file}")
+            except Exception as e:
+                logger.exception(f"Error cargando PDF {pdf_file}: {e}")
 
 # Cargar al inicio del módulo para que la lista muestre archivos existentes tras reinicios
 load_existing_pdfs()
