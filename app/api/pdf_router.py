@@ -604,9 +604,10 @@ async def list_pdfs():
     """
     # Llamar a la función para cargar PDFs existentes
     load_existing_pdfs()
-    # Filtrar solo los archivos que cumplen la nomenclatura obligatoria
-    # Ejemplo válido: "1478 47-10-01-017 C"
-    nomenclature_re = re.compile(r'^\d+\s+\d+(?:-\d+)*\s+[CP]$', re.IGNORECASE)
+    # Filtrar solo los archivos que contienen la nomenclatura obligatoria
+    # Ejemplo válido dentro del nombre: "1478 47-10-01-017 C"
+    # Acepta separadores espacio/guion/underscore y permite sufijos (hashes, versiones)
+    nomenclature_re = re.compile(r"\b\d+[ _-]+\d+(?:-[\d]+)*[ _-]+[CP]\b", re.IGNORECASE)
 
     # Debug: imprimir información de diagnóstico de rutas/archivos
     uploads_dir = Path(settings.UPLOAD_FOLDER)
@@ -630,7 +631,12 @@ async def list_pdfs():
         except Exception:
             name_to_check = str(filename)
 
-        return bool(nomenclature_re.match(name_to_check)) or bool(nomenclature_re.match(str(pdf_id)))
+        # Buscar la nomenclatura en el nombre (no exigir coincidencia completa)
+        if nomenclature_re.search(name_to_check):
+            return True
+        if nomenclature_re.search(str(pdf_id)):
+            return True
+        return False
 
     filtered_items = [(k, v) for k, v in pdf_storage.items() if _name_matches_nomenclature(k, v)]
     
