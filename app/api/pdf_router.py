@@ -27,8 +27,7 @@ import threading
 import subprocess
 import shutil
 
-pdf_storage = {}
-pdf_task_status = {}  # ← esto sobra y causa conflicto
+# No reasignar `pdf_storage`/`pdf_task_status` aquí: usar los del módulo `app.core.state`
 
 # Logger local
 logging.basicConfig(level=logging.INFO)
@@ -608,6 +607,19 @@ async def list_pdfs():
     # Filtrar solo los archivos que cumplen la nomenclatura obligatoria
     # Ejemplo válido: "1478 47-10-01-017 C"
     nomenclature_re = re.compile(r'^\d+\s+\d+(?:-\d+)*\s+[CP]$', re.IGNORECASE)
+
+    # Debug: imprimir información de diagnóstico de rutas/archivos
+    uploads_dir = Path(settings.UPLOAD_FOLDER)
+    outputs_dir = Path(settings.OUTPUTS_FOLDER)
+    logger.info(f"list_pdfs: cwd={os.getcwd()}")
+    logger.info(f"list_pdfs: uploads_dir={uploads_dir.resolve()}")
+    logger.info(f"list_pdfs: outputs_dir={outputs_dir.resolve()}")
+    try:
+        files_in_uploads = [p.name for p in uploads_dir.rglob('*.pdf')] if uploads_dir.exists() else []
+    except Exception as e:
+        files_in_uploads = []
+        logger.exception(f"Error listando uploads: {e}")
+    logger.info(f"list_pdfs: found {len(files_in_uploads)} pdfs in uploads (sample 10): {files_in_uploads[:10]}")
 
     def _name_matches_nomenclature(pdf_id: str, data: dict) -> bool:
         # Preferir el nombre original si está disponible, si no usar el id (stem)
