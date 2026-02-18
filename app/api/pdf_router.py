@@ -18,6 +18,7 @@ from pathlib import Path
 import os
 from datetime import datetime
 from app.core.config import settings
+import re
 from app.tasks.pdf_tasks import process_pdf_task
 from app.core.celery_app import celery_app
 from app.core.state import pdf_storage, pdf_task_status
@@ -583,10 +584,26 @@ async def list_pdfs():
     
     # Llamar a la función para cargar PDFs existentes
     load_existing_pdfs()
+    # Filtrar solo los archivos que cumplen la nomenclatura obligatoria
+    # Ejemplo válido: "1478 47-10-01-017 C"
+    nomenclature_re = re.compile(r'^\d+\s+\d+(?:-\d+)*\s+[CP]$', re.IGNORECASE)
+
+    def _name_matches_nomenclature(pdf_id: str, data: dict) -> bool:
+        # Preferir el nombre original si está disponible, si no usar el id (stem)
+        filename = data.get('filename') or pdf_id
+        # Si filename contiene extensión, tomar el stem
+        try:
+            name_to_check = Path(filename).stem
+        except Exception:
+            name_to_check = str(filename)
+
+        return bool(nomenclature_re.match(name_to_check)) or bool(nomenclature_re.match(str(pdf_id)))
+
+    filtered_items = [(k, v) for k, v in pdf_storage.items() if _name_matches_nomenclature(k, v)]
     
     pdfs_list = []
     
-    for pdf_id, data in pdf_storage.items():
+    for pdf_id, data in filtered_items:
         # Obtener estado de procesamiento
         task_status_info = pdf_task_status.get(pdf_id, {})
         status = task_status_info.get('status', 'unknown')
@@ -657,7 +674,7 @@ async def list_pdfs():
     }
     
     return {
-        "total": len(pdf_storage),
+        "total": len(filtered_items),
         "by_status": {
             "completed": len(by_status['completed']),
             "processing": len(by_status['processing']),
