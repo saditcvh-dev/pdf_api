@@ -36,6 +36,31 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/pdf", tags=["pdf"])
 pdf_service = PDFService()
 
+# Expresión y helper reutilizable para validar la nomenclatura usada en `list_pdfs`
+nomenclature_re = re.compile(r"\b\d+[ _-]+\d+(?:-[\d]+)*[ _-]+[CP]\b", re.IGNORECASE)
+
+def _name_matches_nomenclature(pdf_id: str, data: dict = None) -> bool:
+    """Comprueba si `pdf_id` o el `filename` (si está en `data`) cumplen la nomenclatura.
+    Reutilizado por `list_pdfs` y `global_search` para mantener el mismo criterio.
+    """
+    filename = None
+    if isinstance(data, dict):
+        filename = data.get('filename')
+
+    if not filename:
+        filename = pdf_id
+
+    try:
+        name_to_check = Path(filename).stem
+    except Exception:
+        name_to_check = str(filename)
+
+    if nomenclature_re.search(name_to_check):
+        return True
+    if nomenclature_re.search(str(pdf_id)):
+        return True
+    return False
+
 
 def load_existing_pdfs():
     """Carga PDFs desde las carpetas configuradas en `settings`.
@@ -603,11 +628,6 @@ async def list_pdfs():
     """
     # Llamar a la función para cargar PDFs existentes
     load_existing_pdfs()
-    # Filtrar solo los archivos que contienen la nomenclatura obligatoria
-    # Ejemplo válido dentro del nombre: "1478 47-10-01-017 C"
-    # Acepta separadores espacio/guion/underscore y permite sufijos (hashes, versiones)
-    nomenclature_re = re.compile(r"\b\d+[ _-]+\d+(?:-[\d]+)*[ _-]+[CP]\b", re.IGNORECASE)
-
     # Debug: imprimir información de diagnóstico de rutas/archivos
     uploads_dir = Path(settings.UPLOAD_FOLDER)
     outputs_dir = Path(settings.OUTPUTS_FOLDER)
@@ -621,22 +641,7 @@ async def list_pdfs():
         logger.exception(f"Error listando uploads: {e}")
     logger.info(f"list_pdfs: found {len(files_in_uploads)} pdfs in uploads (sample 10): {files_in_uploads[:10]}")
 
-    def _name_matches_nomenclature(pdf_id: str, data: dict) -> bool:
-        # Preferir el nombre original si está disponible, si no usar el id (stem)
-        filename = data.get('filename') or pdf_id
-        # Si filename contiene extensión, tomar el stem
-        try:
-            name_to_check = Path(filename).stem
-        except Exception:
-            name_to_check = str(filename)
-
-        # Buscar la nomenclatura en el nombre (no exigir coincidencia completa)
-        if nomenclature_re.search(name_to_check):
-            return True
-        if nomenclature_re.search(str(pdf_id)):
-            return True
-        return False
-
+    # Filtrar solo los items que cumplen la nomenclatura (reutiliza el helper global)
     filtered_items = [(k, v) for k, v in pdf_storage.items() if _name_matches_nomenclature(k, v)]
     
     pdfs_list = []
@@ -885,6 +890,12 @@ async def global_search(
         context_chars=context_chars,
         max_documents=max_documents
     )
+
+    # Filtrar por nomenclatura: solo conservar documentos con nombre/ID válido
+    document_results = [
+        doc for doc in document_results
+        if _name_matches_nomenclature(doc.get('pdf_id'), pdf_storage.get(doc.get('pdf_id'), {}))
+    ]
 
     # Calcular estadísticas globales
     total_matches = sum(len(doc['results']) for doc in document_results)
