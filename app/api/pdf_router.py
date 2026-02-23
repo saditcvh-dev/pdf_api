@@ -628,6 +628,8 @@ async def list_pdfs():
     """
     # Llamar a la función para cargar PDFs existentes
     load_existing_pdfs()
+    logger.info(f"pdf_storage total: {len(pdf_storage)}")
+    logger.info(f"pdf_storage sample: {list(pdf_storage.keys())[:5]}")
     # Debug: imprimir información de diagnóstico de rutas/archivos
     uploads_dir = Path(settings.UPLOAD_FOLDER)
     outputs_dir = Path(settings.OUTPUTS_FOLDER)
@@ -642,8 +644,9 @@ async def list_pdfs():
     logger.info(f"list_pdfs: found {len(files_in_uploads)} pdfs in uploads (sample 10): {files_in_uploads[:10]}")
 
     # Filtrar solo los items que cumplen la nomenclatura (reutiliza el helper global)
-    filtered_items = [(k, v) for k, v in pdf_storage.items() if _name_matches_nomenclature(k, v)]
-    
+    # filtered_items = [(k, v) for k, v in pdf_storage.items() if _name_matches_nomenclature(k, v)]
+    filtered_items = list(pdf_storage.items())
+    logger.info(f"filtered_items total: {len(filtered_items)}")
     pdfs_list = []
     
     for pdf_id, data in filtered_items:
