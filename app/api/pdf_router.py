@@ -899,6 +899,55 @@ async def global_search(
         max_documents=max_documents
     )
 
+    # También incluir documentos cuyos `pdf_id` o `filename` coincidan con el término
+    # (útil cuando el texto extraído aún no existe pero queremos buscar por ID/metadata)
+    found_ids = {doc.get('pdf_id') for doc in document_results}
+    term_lower = term.lower() if not case_sensitive else term
+
+    def _load_text_from_path(path: str) -> str:
+        try:
+            if not path:
+                return ""
+            if path.endswith('.gz'):
+                import gzip
+                with gzip.open(path, 'rt', encoding='utf-8') as f:
+                    return f.read()
+            else:
+                with open(path, 'r', encoding='utf-8') as f:
+                    return f.read()
+        except Exception:
+            return ""
+
+    for pdf_id, meta in pdf_storage.items():
+        if pdf_id in found_ids:
+            continue
+
+        filename = meta.get('filename', '')
+        compare_pdf_id = pdf_id if case_sensitive else pdf_id.lower()
+        compare_filename = filename if case_sensitive else filename.lower()
+
+        if (term_lower in compare_pdf_id) or (term_lower in compare_filename):
+            # Intentar buscar en texto extraído si existe
+            text_path = None
+            # Preferir ruta desde task_status
+            ts = pdf_task_status.get(pdf_id, {})
+            text_path = ts.get('extracted_text_path') or meta.get('text_path') or None
+
+            matches = []
+            if text_path and os.path.exists(text_path):
+                text = _load_text_from_path(text_path)
+                if text:
+                    matches = pdf_service.search_in_text(text, term, case_sensitive=case_sensitive, context_chars=context_chars)
+
+            # Si no hay texto, añadimos igual como metadata match (sin resultados)
+            document_results.append({
+                'pdf_id': pdf_id,
+                'filepath': text_path or '',
+                'results': matches,
+                'metadata_match': True
+            })
+
+
     # Filtrar por nomenclatura: solo conservar documentos con nombre/ID válido
     document_results = [
         doc for doc in document_results
@@ -914,13 +963,16 @@ async def global_search(
     for doc in document_results:
         pdf_id = doc['pdf_id']
         filename = pdf_storage.get(pdf_id, {}).get('filename', pdf_id)
-        
+        results_list = doc.get('results', []) or []
+        metadata_match = bool(doc.get('metadata_match', False))
+
         enriched_results.append({
             "pdf_id": pdf_id,
             "filename": filename,
-            "total_matches": len(doc['results']),
-            "results": doc['results'][:20],  # Limitar resultados por documento
-            "score": sum(r['score'] for r in doc['results'])
+            "total_matches": len(results_list),
+            "results": results_list[:20],  # Limitar resultados por documento
+            "score": sum(r['score'] for r in results_list),
+            "metadata_match": metadata_match
         })
 
     execution_time = time.time() - start_time
