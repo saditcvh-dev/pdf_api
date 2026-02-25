@@ -97,10 +97,12 @@ def load_existing_pdfs():
                 upload_time_ts = pdf_file.stat().st_mtime
 
                 pdf_storage[pdf_id] = {
+                    'id': pdf_id,
                     'filename': pdf_file.name,
                     'size': pdf_file.stat().st_size,
                     'upload_time': upload_time_ts,
-                    'pdf_path': str(pdf_file)
+                    'pdf_path': str(pdf_file),
+                    'text': ''
                 }
 
                 # Determinar estado por existencia de texto extraído u output
@@ -159,13 +161,15 @@ async def upload_pdf(file: UploadFile = File(...), use_ocr: bool = Query(True)):
         # 3. Guardar metadatos en memoria
         now = datetime.now()
         pdf_storage[pdf_id] = {
-            'filename': file.filename,
-            'pdf_path': pdf_path,
-            'size': len(file_bytes),
-            'upload_time': time.time(),
-            'task_id': task.id,
-            'use_ocr': use_ocr,
-            'pages': pages_count
+        'id': pdf_id,
+        'filename': file.filename,
+        'pdf_path': pdf_path,
+        'size': len(file_bytes),
+        'upload_time': time.time(),
+        'task_id': task.id,
+        'use_ocr': use_ocr,
+        'pages': pages_count,
+        'text': ''
         }
         
         pdf_task_status[pdf_id] = {
