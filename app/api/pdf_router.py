@@ -947,6 +947,37 @@ async def global_search(
                 'metadata_match': True
             })
 
+    # Además, buscar en los textos ya cargados en memoria (`pdf_storage[...]['text']`)
+    # o en los archivos de texto extraído referenciados por `pdf_task_status`.
+    # Esto asegura que `global_search` cubra todos los documentos que ya tengan texto
+    # extraído en memoria o en disco, no solo el que se acaba de subir.
+    for pdf_id, meta in pdf_storage.items():
+        if pdf_id in {d.get('pdf_id') for d in document_results}:
+            continue
+
+        # Priorizar texto en memoria
+        in_memory_text = meta.get('text') or ''
+        matches = []
+
+        if in_memory_text:
+            matches = pdf_service.search_in_text(in_memory_text, term, case_sensitive=case_sensitive, context_chars=context_chars)
+
+        # Si no hay texto en memoria, intentar cargar desde extracted_text_path
+        if not matches:
+            ts = pdf_task_status.get(pdf_id, {})
+            text_path = ts.get('extracted_text_path') or meta.get('text_path')
+            if text_path and os.path.exists(text_path):
+                txt = _load_text_from_path(text_path)
+                if txt:
+                    matches = pdf_service.search_in_text(txt, term, case_sensitive=case_sensitive, context_chars=context_chars)
+
+        if matches:
+            document_results.append({
+                'pdf_id': pdf_id,
+                'filepath': text_path or '',
+                'results': matches
+            })
+
 
     # Filtrar por nomenclatura: solo conservar documentos con nombre/ID válido
     document_results = [
