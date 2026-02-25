@@ -823,15 +823,20 @@ async def delete_pdf(pdf_id: str):
     pdf_data = pdf_storage[pdf_id]
     
     try:
-        if os.path.exists(pdf_data['pdf_path']):
-            os.remove(pdf_data['pdf_path'])
-        if os.path.exists(pdf_data['text_path']):
-            os.remove(pdf_data['text_path'])
+        # Borrar rutas conocidas de forma segura usando .get() para evitar KeyError
+        for key in ("pdf_path", "text_path", "ocr_pdf_path"):
+            path = pdf_data.get(key)
+            if path and os.path.exists(path):
+                try:
+                    os.remove(path)
+                except Exception:
+                    logger.exception(f"No se pudo eliminar el archivo {path} para {pdf_id}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error eliminando archivos: {str(e)}")
-    
-    del pdf_storage[pdf_id]
-    
+    # Eliminar del almacenamiento en memoria y estado de tareas si existe
+    pdf_storage.pop(pdf_id, None)
+    pdf_task_status.pop(pdf_id, None)
+
     return {"message": f"PDF {pdf_id} eliminado exitosamente"}
 
 @router.post("/quick-search")
