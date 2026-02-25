@@ -366,7 +366,47 @@ async def get_pdf_text(pdf_id: str):
     # Verificar estado del PDF — preferir la fuente `pdf_task_status` cuando exista
     pdf_data = pdf_storage.get(pdf_id, {})
     task_status = pdf_task_status.get(pdf_id, {})
-    current_status = task_status.get('status') or pdf_data.get('status')
+    # Si hay task_id, refrescar estado consultando Celery (asegura que endpoints vean cambios)
+    task_id = task_status.get('task_id') or pdf_data.get('task_id')
+    if task_id:
+        try:
+            task = celery_app.AsyncResult(task_id)
+            # Si la tarea terminó correctamente, actualizar pdf_task_status en memoria
+            if task.state == 'SUCCESS' and isinstance(task.result, dict):
+                result = task.result
+                pdf_task_status[pdf_id] = pdf_task_status.get(pdf_id, {})
+                pdf_task_status[pdf_id].update({
+                    'status': 'completed',
+                    'pages': result.get('pages'),
+                    'extracted_text_path': result.get('text_path'),
+                    'ocr_pdf_path': result.get('pdf_path'),
+                    'used_ocr': result.get('used_ocr'),
+                    'text_length': result.get('text_length'),
+                    'completed_at': datetime.now(),
+                    'error': None,
+                    'task_id': task_id
+                })
+
+                if pdf_id in pdf_storage:
+                    pdf_storage[pdf_id].update({
+                        'pages': result.get('pages'),
+                        'text_path': result.get('text_path'),
+                        'completed': True,
+                        'text': pdf_storage.get(pdf_id, {}).get('text', '')
+                    })
+
+            elif task.state == 'FAILURE':
+                pdf_task_status[pdf_id] = pdf_task_status.get(pdf_id, {})
+                pdf_task_status[pdf_id].update({
+                    'status': 'failed',
+                    'error': str(task.info) if task.info else 'Error desconocido',
+                    'completed_at': datetime.now(),
+                    'task_id': task_id
+                })
+        except Exception:
+            logger.exception(f"No se pudo consultar estado Celery para task {task_id}")
+
+    current_status = pdf_task_status.get(pdf_id, {}).get('status') or pdf_data.get('status')
 
     # Si el PDF aún está pendiente, devolver estado
     if current_status == 'pending' or (not current_status and task_status):
@@ -422,7 +462,43 @@ async def get_searchable_pdf(pdf_id: str):
     if not task_status:
         raise HTTPException(status_code=404, detail="ID de PDF no reconocido")
 
-    current_status = task_status.get("status", "unknown")
+    # Refrescar estado desde Celery si hay task_id
+    task_id = task_status.get('task_id') or pdf_storage.get(pdf_id, {}).get('task_id')
+    if task_id:
+        try:
+            task = celery_app.AsyncResult(task_id)
+            if task.state == 'SUCCESS' and isinstance(task.result, dict):
+                result = task.result
+                pdf_task_status[pdf_id] = pdf_task_status.get(pdf_id, {})
+                pdf_task_status[pdf_id].update({
+                    'status': 'completed',
+                    'pages': result.get('pages'),
+                    'extracted_text_path': result.get('text_path'),
+                    'ocr_pdf_path': result.get('pdf_path'),
+                    'used_ocr': result.get('used_ocr'),
+                    'text_length': result.get('text_length'),
+                    'completed_at': datetime.now(),
+                    'error': None,
+                    'task_id': task_id
+                })
+                if pdf_id in pdf_storage:
+                    pdf_storage[pdf_id].update({
+                        'pages': result.get('pages'),
+                        'text_path': result.get('text_path'),
+                        'completed': True
+                    })
+            elif task.state == 'FAILURE':
+                pdf_task_status[pdf_id] = pdf_task_status.get(pdf_id, {})
+                pdf_task_status[pdf_id].update({
+                    'status': 'failed',
+                    'error': str(task.info) if task.info else 'Error desconocido',
+                    'completed_at': datetime.now(),
+                    'task_id': task_id
+                })
+        except Exception:
+            logger.exception(f"No se pudo consultar estado Celery para task {task_id}")
+
+    current_status = pdf_task_status.get(pdf_id, {}).get("status", pdf_storage.get(pdf_id, {}).get('status', 'unknown'))
 
     if current_status in ("pending", "processing"):
         return JSONResponse(
