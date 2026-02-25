@@ -626,30 +626,63 @@ async def list_pdfs():
     Devuelve la lista de todos los PDFs con su estado de procesamiento.
     Útil para ver qué PDFs están en cola, en proceso o completados.
     """
+    # ========== AGREGAR: Cargar PDFs existentes en disco ==========
+    def load_existing_pdfs():
+        uploads_dir = Path("uploads")
+        if not uploads_dir.exists():
+            return
+            
+        for pdf_file in uploads_dir.glob("*.pdf"):
+            pdf_id = pdf_file.stem
+            
+            # Solo agregar si no existe
+            if pdf_id not in pdf_storage:
+                # Convertir datetime a timestamp (float) para Pydantic
+                upload_time_dt = datetime.fromtimestamp(pdf_file.stat().st_mtime)
+                upload_time_ts = upload_time_dt.timestamp()
+                
+                pdf_storage[pdf_id] = {
+                    'filename': pdf_file.name,
+                    'size': pdf_file.stat().st_size,
+                    'upload_time': upload_time_ts  # TIMESTAMP en lugar de datetime
+                }
+                
+                # Determinar estado basado en archivos
+                txt_path = Path("extracted_texts") / f"{pdf_id}.txt"
+                output_pdf_path = Path("outputs") / f"{pdf_id}.pdf"
+                
+                # Convertir datetime a timestamp para created_at y completed_at
+                created_at_dt = datetime.fromtimestamp(pdf_file.stat().st_mtime)
+                created_at_ts = created_at_dt.timestamp()
+                
+                if txt_path.exists() or output_pdf_path.exists():
+                    # Usar timestamp de modificación del txt o output
+                    if txt_path.exists():
+                        completed_at_ts = txt_path.stat().st_mtime
+                    else:
+                        completed_at_ts = output_pdf_path.stat().st_mtime
+                    
+                    pdf_task_status[pdf_id] = {
+                        'status': 'completed',
+                        'created_at': created_at_ts,  # TIMESTAMP
+                        'completed_at': completed_at_ts,  # TIMESTAMP
+                        'used_ocr': output_pdf_path.exists(),
+                        'extracted_text_path': str(txt_path) if txt_path.exists() else None
+                    }
+                else:
+                    # PDF subido pero no procesado
+                    pdf_task_status[pdf_id] = {
+                        'status': 'unknown',
+                        'created_at': created_at_ts  # TIMESTAMP
+                    }
+    # ========== FIN DE LA PARTE AGREGADA ==========
+    
     # Llamar a la función para cargar PDFs existentes
     load_existing_pdfs()
-    logger.info(f"pdf_storage total: {len(pdf_storage)}")
-    logger.info(f"pdf_storage sample: {list(pdf_storage.keys())[:5]}")
-    # Debug: imprimir información de diagnóstico de rutas/archivos
-    uploads_dir = Path(settings.UPLOAD_FOLDER)
-    outputs_dir = Path(settings.OUTPUTS_FOLDER)
-    logger.info(f"list_pdfs: cwd={os.getcwd()}")
-    logger.info(f"list_pdfs: uploads_dir={uploads_dir.resolve()}")
-    logger.info(f"list_pdfs: outputs_dir={outputs_dir.resolve()}")
-    try:
-        files_in_uploads = [p.name for p in uploads_dir.rglob('*.pdf')] if uploads_dir.exists() else []
-    except Exception as e:
-        files_in_uploads = []
-        logger.exception(f"Error listando uploads: {e}")
-    logger.info(f"list_pdfs: found {len(files_in_uploads)} pdfs in uploads (sample 10): {files_in_uploads[:10]}")
-
-    # Filtrar solo los items que cumplen la nomenclatura (reutiliza el helper global)
-    # filtered_items = [(k, v) for k, v in pdf_storage.items() if _name_matches_nomenclature(k, v)]
-    filtered_items = list(pdf_storage.items())
-    logger.info(f"filtered_items total: {len(filtered_items)}")
+    
     pdfs_list = []
     
-    for pdf_id, data in filtered_items:
+    for pdf_id, data in pdf_storage.items():
         # Obtener estado de procesamiento
         task_status_info = pdf_task_status.get(pdf_id, {})
         status = task_status_info.get('status', 'unknown')
@@ -720,7 +753,7 @@ async def list_pdfs():
     }
     
     return {
-        "total": len(filtered_items),
+        "total": len(pdf_storage),
         "by_status": {
             "completed": len(by_status['completed']),
             "processing": len(by_status['processing']),
