@@ -26,6 +26,7 @@ import logging
 import threading
 import subprocess
 import shutil
+import sys
 
 # No reasignar `pdf_storage`/`pdf_task_status` aquí: usar los del módulo `app.core.state`
 
@@ -619,7 +620,7 @@ async def merge_with_output(
         ocr_second_output = os.path.join(settings.OUTPUTS_FOLDER, f"{second_id}.pdf")
 
         command = [
-            "ocrmypdf",
+            sys.executable, "-m", "ocrmypdf",
             "-l", "spa",
             "--force-ocr",
             "--optimize", "0",
