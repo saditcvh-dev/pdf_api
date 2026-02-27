@@ -106,8 +106,13 @@ def load_existing_pdfs():
 
                 upload_time_ts = pdf_file.stat().st_mtime
 
+                # Reconstruir nombre legible: quitar hash (_últimos 17 chars) y reemplazar _ con espacios
+                # pdf_id tiene formato: {safe_name}_{16_hex_chars}
+                safe_name_part = pdf_id[:-17] if len(pdf_id) > 17 else pdf_id
+                readable_name = safe_name_part.replace('_', ' ')
+
                 pdf_storage[pdf_id] = {
-                    'filename': pdf_file.name,
+                    'filename': f"{readable_name}.pdf",
                     'size': pdf_file.stat().st_size,
                     'upload_time': upload_time_ts,
                     'pdf_path': str(pdf_file)
@@ -1073,9 +1078,12 @@ async def global_search(
         )
 
         if matches:
+            filename = meta.get('filename', f'{pdf_id}.pdf')
+            nombre_carpeta = Path(filename).stem  # Sin extensión, con espacios
             document_results.append({
                 "pdf_id": pdf_id,
-                "filename": meta.get('filename', pdf_id),
+                "filename": filename,
+                "nombre_carpeta": nombre_carpeta,
                 "total_matches": len(matches),
                 "results": matches[:20],
                 "score": sum(r['score'] for r in matches),
