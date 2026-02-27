@@ -62,6 +62,12 @@ def _name_matches_nomenclature(pdf_id: str, data: dict = None) -> bool:
     return False
 
 
+# Patrón estricto para IDs válidos (sin la extensión .pdf, usamos pdf_file.stem)
+VALID_PATTERN = re.compile(
+    r'^\d+_\d{1,2}-\d{1,2}-\d{1,3}-\d{1,3}_[CP]_[a-f0-9]+$'
+)
+
+
 def load_existing_pdfs():
     """Carga PDFs desde las carpetas configuradas en `settings`.
     Esta función puede llamarse al inicio para poblar `pdf_storage` y `pdf_task_status`.
@@ -86,6 +92,10 @@ def load_existing_pdfs():
             try:
                 pdf_id = pdf_file.stem
 
+                # Ignorar nombres que no cumplen el patrón válido
+                if not VALID_PATTERN.match(pdf_id):
+                    logger.info(f"Ignorado por nomenclatura inválida: {pdf_file.name}")
+                    continue
                 # Evitar procesar archivos temporales o nombres vacíos
                 if not pdf_id or pdf_id.startswith("."):
                     continue
