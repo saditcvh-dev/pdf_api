@@ -1011,23 +1011,10 @@ async def global_search(
     max_documents: int = Query(100, description="Máximo número de documentos a procesar")
 ):
     """
-    Busca un término en TODOS los PDFs procesados y almacenados.
-    Devuelve lista de documentos con coincidencias, ordenados por relevancia.
+    Busca un término en los PDFs que cumplen la nomenclatura (mismo criterio que /list).
     """
     start_time = time.time()
-
-    # Usar el método del servicio
-    document_results = pdf_service.search_across_documents(
-        search_term=term,
-        case_sensitive=case_sensitive,
-        context_chars=context_chars,
-        max_documents=max_documents
-    )
-
-    # También incluir documentos cuyos `pdf_id` o `filename` coincidan con el término
-    # (útil cuando el texto extraído aún no existe pero queremos buscar por ID/metadata)
-    found_ids = {doc.get('pdf_id') for doc in document_results}
-    term_lower = term.lower() if not case_sensitive else term
+    extracted_dir = Path(settings.EXTRACTED_FOLDER)
 
     def _load_text_from_path(path: str) -> str:
         try:
@@ -1043,102 +1030,68 @@ async def global_search(
         except Exception:
             return ""
 
-    for pdf_id, meta in pdf_storage.items():
-        if pdf_id in found_ids:
-            continue
+    # Solo PDFs que cumplen la nomenclatura, igual que /list
+    valid_entries = [
+        (pdf_id, meta)
+        for pdf_id, meta in pdf_storage.items()
+        if _name_matches_nomenclature(pdf_id, meta)
+    ]
 
-        filename = meta.get('filename', '')
-        compare_pdf_id = pdf_id if case_sensitive else pdf_id.lower()
-        compare_filename = filename if case_sensitive else filename.lower()
+    document_results = []
 
-        if (term_lower in compare_pdf_id) or (term_lower in compare_filename):
-            # Intentar buscar en texto extraído si existe
-            text_path = None
-            # Preferir ruta desde task_status
-            ts = pdf_task_status.get(pdf_id, {})
-            text_path = ts.get('extracted_text_path') or meta.get('text_path') or None
+    for pdf_id, meta in valid_entries[:max_documents]:
+        ts = pdf_task_status.get(pdf_id, {})
 
-            matches = []
-            if text_path and os.path.exists(text_path):
-                text = _load_text_from_path(text_path)
-                if text:
-                    matches = pdf_service.search_in_text(text, term, case_sensitive=case_sensitive, context_chars=context_chars)
+        # 1. Intentar texto en memoria
+        text = meta.get('text') or ''
 
-            # Si no hay texto, añadimos igual como metadata match (sin resultados)
-            document_results.append({
-                'pdf_id': pdf_id,
-                'filepath': text_path or '',
-                'results': matches,
-                'metadata_match': True
-            })
-
-    # Además, buscar en los textos ya cargados en memoria (`pdf_storage[...]['text']`)
-    # o en los archivos de texto extraído referenciados por `pdf_task_status`.
-    # Esto asegura que `global_search` cubra todos los documentos que ya tengan texto
-    # extraído en memoria o en disco, no solo el que se acaba de subir.
-    for pdf_id, meta in pdf_storage.items():
-        if pdf_id in {d.get('pdf_id') for d in document_results}:
-            continue
-
-        # Priorizar texto en memoria
-        in_memory_text = meta.get('text') or ''
-        matches = []
-
-        if in_memory_text:
-            matches = pdf_service.search_in_text(in_memory_text, term, case_sensitive=case_sensitive, context_chars=context_chars)
-
-        # Si no hay texto en memoria, intentar cargar desde extracted_text_path
-        if not matches:
-            ts = pdf_task_status.get(pdf_id, {})
+        # 2. Si no hay en memoria, buscar en disco
+        if not text:
             text_path = ts.get('extracted_text_path') or meta.get('text_path')
-            if text_path and os.path.exists(text_path):
-                txt = _load_text_from_path(text_path)
-                if txt:
-                    matches = pdf_service.search_in_text(txt, term, case_sensitive=case_sensitive, context_chars=context_chars)
+
+            # Si la ruta no está en estado o el archivo no existe, buscar en extracted_texts/
+            if not text_path or not os.path.exists(str(text_path)):
+                txt_candidate = extracted_dir / f"{pdf_id}.txt"
+                txt_gz_candidate = extracted_dir / f"{pdf_id}.txt.gz"
+                if txt_candidate.exists():
+                    text_path = str(txt_candidate)
+                elif txt_gz_candidate.exists():
+                    text_path = str(txt_gz_candidate)
+                else:
+                    text_path = None
+
+            if text_path:
+                text = _load_text_from_path(text_path)
+
+        if not text:
+            continue
+
+        matches = pdf_service.search_in_text(
+            text, term,
+            case_sensitive=case_sensitive,
+            context_chars=context_chars
+        )
 
         if matches:
             document_results.append({
-                'pdf_id': pdf_id,
-                'filepath': text_path or '',
-                'results': matches
+                "pdf_id": pdf_id,
+                "filename": meta.get('filename', pdf_id),
+                "total_matches": len(matches),
+                "results": matches[:20],
+                "score": sum(r['score'] for r in matches),
             })
 
-
-    # Filtrar por nomenclatura: solo conservar documentos con nombre/ID válido
-    document_results = [
-        doc for doc in document_results
-        if _name_matches_nomenclature(doc.get('pdf_id'), pdf_storage.get(doc.get('pdf_id'), {}))
-    ]
-
-    # Calcular estadísticas globales
-    total_matches = sum(len(doc['results']) for doc in document_results)
-    total_documents_with_matches = len(document_results)
-
-    # Enriquecer respuesta con filename desde pdf_storage (opcional)
-    enriched_results = []
-    for doc in document_results:
-        pdf_id = doc['pdf_id']
-        filename = pdf_storage.get(pdf_id, {}).get('filename', pdf_id)
-        results_list = doc.get('results', []) or []
-        metadata_match = bool(doc.get('metadata_match', False))
-
-        enriched_results.append({
-            "pdf_id": pdf_id,
-            "filename": filename,
-            "total_matches": len(results_list),
-            "results": results_list[:20],  # Limitar resultados por documento
-            "score": sum(r['score'] for r in results_list),
-            "metadata_match": metadata_match
-        })
+    # Ordenar por relevancia
+    document_results.sort(key=lambda x: x['score'], reverse=True)
 
     execution_time = time.time() - start_time
 
     return {
         "term": term,
-        "total_documents_with_matches": total_documents_with_matches,
-        "total_matches": total_matches,
+        "total_documents_with_matches": len(document_results),
+        "total_matches": sum(doc['total_matches'] for doc in document_results),
         "execution_time": execution_time,
-        "documents": enriched_results
+        "documents": document_results
     }
 
 
