@@ -779,8 +779,12 @@ async def list_pdfs():
     load_existing_pdfs()
     
     pdfs_list = []
-    
+
     for pdf_id, data in pdf_storage.items():
+        # Solo incluir PDFs que cumplan la nomenclatura
+        if not _name_matches_nomenclature(pdf_id, data):
+            continue
+
         # Obtener estado de procesamiento
         task_status_info = pdf_task_status.get(pdf_id, {})
         status = task_status_info.get('status', 'unknown')
@@ -851,7 +855,7 @@ async def list_pdfs():
     }
     
     return {
-        "total": len(pdf_storage),
+        "total": len(pdfs_list),
         "by_status": {
             "completed": len(by_status['completed']),
             "processing": len(by_status['processing']),
