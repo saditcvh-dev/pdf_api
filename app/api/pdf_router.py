@@ -37,7 +37,7 @@ router = APIRouter(prefix="/api/pdf", tags=["pdf"])
 pdf_service = PDFService()
 
 # Expresión y helper reutilizable para validar la nomenclatura usada en `list_pdfs`
-nomenclature_re = re.compile(r"\b\d+[ _-]+\d+(?:-[\d]+)*[ _-]+[CP]\b", re.IGNORECASE)
+nomenclature_re = re.compile(r"\b\d+[ _-]+\d+(?:-[\d]+)*[ _-]+[CP](?=[\s_-]|$)", re.IGNORECASE)
 
 def _name_matches_nomenclature(pdf_id: str, data: dict = None) -> bool:
     """Comprueba si `pdf_id` o el `filename` (si está en `data`) cumplen la nomenclatura.
@@ -115,18 +115,24 @@ def load_existing_pdfs():
 
                 # Determinar estado por existencia de texto extraído u output
                 txt_path = extracted_dir / f"{pdf_id}.txt"
+                txt_gz_path = extracted_dir / f"{pdf_id}.txt.gz"
                 output_pdf_path = outputs_dir / f"{pdf_id}.pdf"
 
                 created_at_ts = upload_time_ts
 
-                if txt_path.exists() or output_pdf_path.exists():
-                    completed_at_ts = txt_path.stat().st_mtime if txt_path.exists() else output_pdf_path.stat().st_mtime
+                actual_txt_path = txt_path if txt_path.exists() else (txt_gz_path if txt_gz_path.exists() else None)
+
+                if actual_txt_path or output_pdf_path.exists():
+                    if actual_txt_path:
+                        completed_at_ts = actual_txt_path.stat().st_mtime
+                    else:
+                        completed_at_ts = output_pdf_path.stat().st_mtime
                     pdf_task_status[pdf_id] = {
                         'status': 'completed',
                         'created_at': created_at_ts,
                         'completed_at': completed_at_ts,
                         'used_ocr': output_pdf_path.exists(),
-                        'extracted_text_path': str(txt_path) if txt_path.exists() else None,
+                        'extracted_text_path': str(actual_txt_path) if actual_txt_path else None,
                         'ocr_pdf_path': str(output_pdf_path) if output_pdf_path.exists() else None,
                         'task_id': None
                     }
