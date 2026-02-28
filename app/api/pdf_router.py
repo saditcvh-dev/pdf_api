@@ -157,87 +157,59 @@ def load_existing_pdfs():
 
 @router.post("/upload", response_model=PDFUploadResponse)
 async def upload_pdf(file: UploadFile = File(...), use_ocr: bool = Query(True)):
-    """Sube un PDF a la cola de procesamiento sin esperar a que se procese"""
+    """Sube un PDF. Si hay workers, encola en Celery; si no, procesa en hilo local."""
     try:
-        if not file.filename.lower().endswith('.pdf'):
+        if not file.filename.lower().endswith(".pdf"):
             raise HTTPException(status_code=400, detail="Solo se permiten archivos PDF")
-        
+
         file_bytes = await file.read()
         pdf_id = pdf_service.generate_pdf_id(file.filename, file_bytes)
         pages_count = pdf_service.get_pdf_pages_count(file_bytes)
 
-        # 1. Guardar archivo PDF
+        # 1) Guardar PDF
+        os.makedirs(settings.UPLOAD_FOLDER, exist_ok=True)
         pdf_path = os.path.join(settings.UPLOAD_FOLDER, f"{pdf_id}.pdf")
         with open(pdf_path, "wb") as f:
             f.write(file_bytes)
-        
-        # 2. Encolar tarea de procesamiento en Celery
-        task = process_pdf_task.delay(
-            pdf_id=pdf_id,
-            pdf_path=pdf_path,
-            use_ocr=use_ocr
-        )
-        
-        # 3. Guardar metadatos en memoria
+
         now = datetime.now()
-        pdf_storage[pdf_id] = {
-            'filename': file.filename,
-            'pdf_path': pdf_path,
-            'size': len(file_bytes),
-            'upload_time': time.time(),
-            'task_id': task.id,
-            'use_ocr': use_ocr,
-            'pages': pages_count
-        }
-        
-        pdf_task_status[pdf_id] = {
-            'task_id': task.id,
-            'status': 'pending',
-            'created_at': now,
-            'completed_at': None,
-            'pages': pages_count,
-            'extracted_text_path': None,
-            'used_ocr': use_ocr,
-            'error': None
-        }
-        
-        # 4. Devolver respuesta inmediata
-        # Si no hay workers conectados, procesar sincrónicamente (mantener comportamiento previo)
+
+        # 2) Detectar workers Celery
+        has_workers = False
         try:
             inspector = celery_app.control.inspect()
-            registered = inspector.registered() if inspector else None
+            ping = inspector.ping() if inspector else None
+            has_workers = bool(ping)
         except Exception:
-            registered = None
+            has_workers = False
 
-        if not registered:
-            # No hay workers -> procesar en background local (no bloquear la petición)
-            logger.warning(f"No Celery workers detectados — procesando en hilo local {pdf_id}")
+        # 3) Guardar metadatos base
+        pdf_storage[pdf_id] = {
+            "filename": file.filename,
+            "pdf_path": pdf_path,
+            "size": len(file_bytes),
+            "upload_time": time.time(),
+            "pages": pages_count,
+            "use_ocr": use_ocr,
+        }
 
-            def _local_process(pid: str, ppath: str, puse_ocr: bool, t_id: str):
-                try:
-                    pdf_task_status[pid].update({'status': 'processing'})
-                    text, pages, used_ocr = pdf_service.extract_text_from_pdf(ppath, use_ocr=puse_ocr)
-                    text_path = pdf_service.save_extracted_text(text, pid)
+        # 4) Si hay workers -> Celery
+        if has_workers:
+            task = process_pdf_task.delay(pdf_id=pdf_id, pdf_path=pdf_path, use_ocr=use_ocr)
 
-                    pdf_task_status[pid].update({
-                        'status': 'completed',
-                        'pages': pages,
-                        'extracted_text_path': text_path,
-                        'used_ocr': used_ocr,
-                        'completed_at': datetime.now()
-                    })
-
-                    pdf_storage[pid].update({
-                        'pages': pages,
-                        'text_path': text_path,
-                        'text': ''
-                    })
-                except Exception as e:
-                    logger.exception(f"Error en procesamiento local {pid}: {e}")
-                    pdf_task_status[pid].update({'status': 'failed', 'error': str(e)})
-
-            thread = threading.Thread(target=_local_process, args=(pdf_id, pdf_path, use_ocr, task.id), daemon=True)
-            thread.start()
+            pdf_storage[pdf_id].update({"task_id": task.id, "mode": "celery"})
+            pdf_task_status[pdf_id] = {
+                "task_id": task.id,
+                "status": "pending",
+                "mode": "celery",
+                "created_at": now,
+                "completed_at": None,
+                "pages": pages_count,
+                "extracted_text_path": None,
+                "ocr_pdf_path": None,
+                "used_ocr": use_ocr,
+                "error": None,
+            }
 
             return PDFUploadResponse(
                 id=pdf_id,
@@ -245,113 +217,144 @@ async def upload_pdf(file: UploadFile = File(...), use_ocr: bool = Query(True)):
                 size=len(file_bytes),
                 task_id=task.id,
                 status="pending",
-                message="PDF aceptado y procesando localmente (no hay workers).",
-                estimated_wait_time=0.0 ,
+                message="PDF encolado para procesamiento (Celery). Usa /upload-status/{pdf_id}.",
+                estimated_wait_time=10.0,
                 pages=pages_count,
             )
 
-        # Si hay workers, devolvemos response pendiente como antes
+        # 5) Si NO hay workers -> hilo local
+        pdf_storage[pdf_id].update({"task_id": None, "mode": "local"})
+        pdf_task_status[pdf_id] = {
+            "task_id": None,
+            "status": "pending",
+            "mode": "local",
+            "created_at": now,
+            "completed_at": None,
+            "pages": pages_count,
+            "extracted_text_path": None,
+            "ocr_pdf_path": None,
+            "used_ocr": use_ocr,
+            "error": None,
+        }
+
+        def _local_process(pid: str, ppath: str, puse_ocr: bool):
+            try:
+                pdf_task_status[pid].update({"status": "processing"})
+                text, pages, used_ocr = pdf_service.extract_text_from_pdf(ppath, use_ocr=puse_ocr)
+                text_path = pdf_service.save_extracted_text(text, pid)
+
+                pdf_task_status[pid].update({
+                    "status": "completed",
+                    "pages": pages,
+                    "extracted_text_path": text_path,
+                    "used_ocr": used_ocr,
+                    "completed_at": datetime.now(),
+                    "error": None,
+                })
+
+                # Importante: NO guardes el texto completo en memoria (puede ser gigante)
+                pdf_storage[pid].update({
+                    "pages": pages,
+                    "text_path": text_path,
+                })
+            except Exception as e:
+                logger.exception(f"Error en procesamiento local {pid}: {e}")
+                pdf_task_status[pid].update({"status": "failed", "error": str(e), "completed_at": datetime.now()})
+
+        threading.Thread(target=_local_process, args=(pdf_id, pdf_path, use_ocr), daemon=True).start()
+
         return PDFUploadResponse(
             id=pdf_id,
             filename=file.filename,
             size=len(file_bytes),
-            task_id=task.id,
+            task_id="",
             status="pending",
-            message="PDF encolado para procesamiento. Usa el endpoint /upload-status/{pdf_id} para consultar el progreso",
-            estimated_wait_time=10.0  # Estimado en segundos
-            ,pages=pages_count,
+            message="PDF aceptado y procesando localmente (no hay workers). Usa /upload-status/{pdf_id}.",
+            estimated_wait_time=0.0,
+            pages=pages_count,
         )
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error al encolar PDF: {str(e)}")
 
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error al subir PDF: {str(e)}")
 
 @router.get("/upload-status/{pdf_id}", response_model=PDFUploadStatus)
 async def get_upload_status(pdf_id: str):
-    """
-    Consulta el estado actual del procesamiento de un PDF.
-    Actualiza la información en memoria cuando la tarea ya terminó.
-    """
     if pdf_id not in pdf_task_status:
         raise HTTPException(status_code=404, detail="PDF no encontrado")
 
-    task_info = pdf_task_status[pdf_id]
-    task_id = task_info.get('task_id')
+    info = pdf_task_status[pdf_id]
+    task_id = info.get("task_id")
+    mode = info.get("mode") or ("celery" if task_id else "local")
 
-    if not task_id:
-        raise HTTPException(status_code=500, detail="No se encontró ID de tarea asociado")
+    # 1) Si es local (o no hay task_id), NO consultes Celery
+    if mode == "local" or not task_id:
+        status = info.get("status", "unknown")
+        progress = 10 if status == "pending" else 50 if status == "processing" else 100 if status == "completed" else 0
 
-    # Consultamos el estado real de Celery
+        return PDFUploadStatus(
+            pdf_id=pdf_id,
+            task_id="",
+            status=status,
+            progress=progress,
+            pages=info.get("pages"),
+            extracted_text_path=info.get("extracted_text_path"),
+            ocr_pdf_path=info.get("ocr_pdf_path"),
+            used_ocr=info.get("used_ocr"),
+            error=info.get("error"),
+            created_at=info.get("created_at"),
+            completed_at=info.get("completed_at"),
+        )
+
+    # 2) Si es celery, consulta Celery
     task = celery_app.AsyncResult(task_id)
-
-    # Mapeo de estados de Celery → nuestros estados
     status_map = {
-        'PENDING': 'pending',
-        'STARTED': 'processing',
-        'RETRY': 'processing',       # si hay reintentos
-        'SUCCESS': 'completed',
-        'FAILURE': 'failed',
+        "PENDING": "pending",
+        "STARTED": "processing",
+        "RETRY": "processing",
+        "SUCCESS": "completed",
+        "FAILURE": "failed",
     }
-
     current_status = status_map.get(task.state, task.state.lower())
 
-    # Si la tarea ya terminó exitosamente → actualizamos el estado en memoria
-    if task.state == 'SUCCESS' and isinstance(task.result, dict):
+    if task.state == "SUCCESS" and isinstance(task.result, dict):
         result = task.result
-        
         pdf_task_status[pdf_id].update({
-            'status': 'completed',
-            'pages': result.get('pages'),
-            'extracted_text_path': result.get('text_path'),
-            'ocr_pdf_path': result.get('pdf_path'),          # ← ruta del PDF con OCR
-            'used_ocr': result.get('used_ocr'),
-            'text_length': result.get('text_length'),
-            'completed_at': datetime.now(),
-            'error': None
+            "status": "completed",
+            "pages": result.get("pages"),
+            "extracted_text_path": result.get("text_path"),
+            "ocr_pdf_path": result.get("pdf_path"),
+            "used_ocr": result.get("used_ocr"),
+            "text_length": result.get("text_length"),
+            "completed_at": datetime.now(),
+            "error": None,
+            "mode": "celery",
+        })
+    elif task.state == "FAILURE":
+        err = str(task.info) if task.info else "Error desconocido"
+        pdf_task_status[pdf_id].update({
+            "status": "failed",
+            "error": err,
+            "completed_at": datetime.now(),
+            "mode": "celery",
         })
 
-        # Opcional: también podemos actualizar pdf_storage si lo usas
-        if pdf_id in pdf_storage:
-            pdf_storage[pdf_id].update({
-                'pages': result.get('pages'),
-                'text_path': result.get('text_path'),
-                'completed': True
-            })
-
-    # Si falló → guardamos el error
-    elif task.state == 'FAILURE':
-        error_msg = str(task.info) if task.info else "Error desconocido en el procesamiento"
-        pdf_task_status[pdf_id].update({
-            'status': 'failed',
-            'error': error_msg,
-            'completed_at': datetime.now()
-        })
-        logger.error(f"Error en tarea {task_id} para pdf {pdf_id}: {error_msg}")
-
-    # Construimos la respuesta final
-    task_status = pdf_task_status[pdf_id]
-
-    # Calculamos un progreso aproximado (puedes ajustarlo según necesites)
-    progress = 0
-    if current_status == 'completed':
-        progress = 100
-    elif current_status == 'processing':
-        progress = 50
-    elif current_status == 'pending':
-        progress = 10
+    final = pdf_task_status[pdf_id]
+    progress = 10 if current_status == "pending" else 50 if current_status == "processing" else 100 if current_status == "completed" else 0
 
     return PDFUploadStatus(
         pdf_id=pdf_id,
         task_id=task_id,
         status=current_status,
         progress=progress,
-        pages=task_status.get('pages'),
-        extracted_text_path=task_status.get('extracted_text_path'),
-        ocr_pdf_path=task_status.get('ocr_pdf_path'),           # ahora estará disponible
-        used_ocr=task_status.get('used_ocr'),
-        error=task_status.get('error'),
-        created_at=task_status.get('created_at'),
-        completed_at=task_status.get('completed_at')
+        pages=final.get("pages"),
+        extracted_text_path=final.get("extracted_text_path"),
+        ocr_pdf_path=final.get("ocr_pdf_path"),
+        used_ocr=final.get("used_ocr"),
+        error=final.get("error"),
+        created_at=final.get("created_at"),
+        completed_at=final.get("completed_at"),
     )
 
 @router.post("/{pdf_id}/search", response_model=SearchResponse)
