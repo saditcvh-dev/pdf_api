@@ -1,53 +1,51 @@
-from fastapi import APIRouter, UploadFile, File, HTTPException, Query, Body
+from fastapi import APIRouter, UploadFile, File, HTTPException, Query
 from fastapi.responses import FileResponse, JSONResponse
 import os
 import time
 from datetime import datetime
-from typing import List, Dict
-from app.services.pdf_service import PDFService
-from app.models.schemas import (
-    PDFUploadResponse, 
-    PDFUploadStatus,
-    SearchRequest, 
-    SearchResponse,
-    PDFInfo,
-    PDFListItem,
-    PDFListResponse
-)
 from pathlib import Path
-import os
-from datetime import datetime
-from app.core.config import settings
 import re
-from app.tasks.pdf_tasks import process_pdf_task
-from app.core.celery_app import celery_app
-from app.core.state import pdf_storage, pdf_task_status
 import logging
 import threading
 import subprocess
-import shutil
 import sys
+import gzip
+from typing import Optional, Dict, Any
 
-# No reasignar `pdf_storage`/`pdf_task_status` aquí: usar los del módulo `app.core.state`
+from app.services.pdf_service import PDFService
+from app.models.schemas import (
+    PDFUploadResponse,
+    PDFUploadStatus,
+    SearchRequest,
+    SearchResponse,
+    PDFListResponse,
+)
+from app.tasks.pdf_tasks import process_pdf_task
+from app.core.celery_app import celery_app
+from app.core.state import pdf_storage, pdf_task_status
+from app.core.config import settings
 
-# Logger local
+# =========================
+# Setup
+# =========================
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/pdf", tags=["pdf"])
 pdf_service = PDFService()
 
-# Expresión y helper reutilizable para validar la nomenclatura usada en `list_pdfs`
+# =========================
+# Nomenclatura / patrones
+# =========================
+
+# Regla de filtro "humana" para /list y /global-search
 nomenclature_re = re.compile(r"\b\d+[ _-]+\d+(?:-[\d]+)*[ _-]+[CP](?=[\s_-]|$)", re.IGNORECASE)
 
 def _name_matches_nomenclature(pdf_id: str, data: dict = None) -> bool:
-    """Comprueba si `pdf_id` o el `filename` (si está en `data`) cumplen la nomenclatura.
-    Reutilizado por `list_pdfs` y `global_search` para mantener el mismo criterio.
-    """
     filename = None
     if isinstance(data, dict):
-        filename = data.get('filename')
-
+        filename = data.get("filename")
     if not filename:
         filename = pdf_id
 
@@ -56,28 +54,84 @@ def _name_matches_nomenclature(pdf_id: str, data: dict = None) -> bool:
     except Exception:
         name_to_check = str(filename)
 
-    if nomenclature_re.search(name_to_check):
-        return True
-    if nomenclature_re.search(str(pdf_id)):
-        return True
-    return False
+    return bool(nomenclature_re.search(name_to_check) or nomenclature_re.search(str(pdf_id)))
 
+# Patrón estricto de IDs del flujo normal (sin .pdf)
+VALID_PATTERN = re.compile(r"^\d+_\d{1,2}-\d{1,2}-\d{1,3}-\d{1,3}_[CP]_[a-f0-9]+$")
 
-# Patrón estricto para IDs válidos (sin la extensión .pdf, usamos pdf_file.stem)
-VALID_PATTERN = re.compile(
-    r'^\d+_\d{1,2}-\d{1,2}-\d{1,3}-\d{1,3}_[CP]_[a-f0-9]+$'
-)
+# Base id para versionados (si existe DOCS_ROOT)
+BASE_ID_PATTERN = re.compile(r"^\d+_\d{1,2}_\d{1,2}_\d{1,3}_\d{1,3}_[CP]$", re.IGNORECASE)
+VERSIONED_FILE_PATTERN = re.compile(r"^(?P<base>.+)_v(?P<v>\d+)_(?P<ts>\d+)\.pdf$", re.IGNORECASE)
 
+def _is_base_id(name: str) -> bool:
+    return bool(BASE_ID_PATTERN.match(name or ""))
 
-def load_existing_pdfs():
-    """Carga PDFs desde las carpetas configuradas en `settings`.
-    Esta función puede llamarse al inicio para poblar `pdf_storage` y `pdf_task_status`.
+def _pick_latest_version_pdf(folder: Path, base_id: str) -> Optional[Path]:
+    """
+    Elige el PDF más nuevo por:
+      1) versión vN más alta
+      2) ts más alto
+      3) mtime más alto (fallback)
+    """
+    best = None
+    best_key = None
+
+    try:
+        for f in folder.iterdir():
+            if not f.is_file() or f.suffix.lower() != ".pdf":
+                continue
+            m = VERSIONED_FILE_PATTERN.match(f.name)
+            if not m:
+                continue
+            if m.group("base") != base_id:
+                continue
+
+            v = int(m.group("v"))
+            ts = int(m.group("ts"))
+            mtime = int(f.stat().st_mtime)
+            key = (v, ts, mtime)
+
+            if best_key is None or key > best_key:
+                best_key = key
+                best = f
+    except Exception:
+        return None
+
+    return best
+
+# =========================
+# Helpers de archivos / estado
+# =========================
+
+def _safe_join_under_root(root: Path, rel: str) -> Path:
+    root = root.resolve()
+    candidate = (root / rel).resolve()
+    if not str(candidate).startswith(str(root)):
+        raise HTTPException(status_code=400, detail="Ruta inválida")
+    return candidate
+
+def _load_text_from_file(path: str) -> str:
+    try:
+        if not path:
+            return ""
+        if path.endswith(".gz"):
+            with gzip.open(path, "rt", encoding="utf-8", errors="ignore") as f:
+                return f.read()
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            return f.read()
+    except Exception:
+        return ""
+
+def load_existing_pdfs() -> None:
+    """
+    Carga PDFs existentes del flujo normal desde UPLOAD_FOLDER/OUTPUTS_FOLDER.
+    - Rellena pdf_storage y pdf_task_status.
+    - created_at/completed_at se guardan como datetime (porque tu schema así lo pide).
     """
     uploads_dir = Path(settings.UPLOAD_FOLDER)
     extracted_dir = Path(settings.EXTRACTED_FOLDER)
     outputs_dir = Path(settings.OUTPUTS_FOLDER)
 
-    # Buscar en uploads y outputs, recursivamente, para cubrir distintos flujos
     search_dirs = []
     if uploads_dir.exists():
         search_dirs.append(uploads_dir)
@@ -85,7 +139,6 @@ def load_existing_pdfs():
         search_dirs.append(outputs_dir)
 
     if not search_dirs:
-        logger.info("No se encontraron carpetas uploads/outputs existentes para escanear.")
         return
 
     for base in search_dirs:
@@ -93,80 +146,180 @@ def load_existing_pdfs():
             try:
                 pdf_id = pdf_file.stem
 
-                # Ignorar nombres que no cumplen el patrón válido
                 if not VALID_PATTERN.match(pdf_id):
-                    logger.info(f"Ignorado por nomenclatura inválida: {pdf_file.name}")
                     continue
-                # Evitar procesar archivos temporales o nombres vacíos
                 if not pdf_id or pdf_id.startswith("."):
                     continue
-
-                # Solo agregar si no existe
                 if pdf_id in pdf_storage:
                     continue
 
-                upload_time_ts = pdf_file.stat().st_mtime
+                mtime = float(pdf_file.stat().st_mtime)
+                created_at_dt = datetime.fromtimestamp(mtime)
 
-                # Reconstruir nombre legible: quitar hash (_últimos 17 chars) y reemplazar _ con espacios
-                # pdf_id tiene formato: {safe_name}_{16_hex_chars}
                 safe_name_part = pdf_id[:-17] if len(pdf_id) > 17 else pdf_id
-                readable_name = safe_name_part.replace('_', ' ')
+                readable_name = safe_name_part.replace("_", " ")
 
                 pdf_storage[pdf_id] = {
-                    'filename': f"{readable_name}.pdf",
-                    'size': pdf_file.stat().st_size,
-                    'upload_time': upload_time_ts,
-                    'pdf_path': str(pdf_file)
+                    "filename": f"{readable_name}.pdf",
+                    "size": pdf_file.stat().st_size,
+                    "upload_time": mtime,  # float (tu schema lo pide)
+                    "pdf_path": str(pdf_file),
+                    "mode": "local",
+                    "task_id": None,
                 }
 
-                # Determinar estado por existencia de texto extraído u output
                 txt_path = extracted_dir / f"{pdf_id}.txt"
                 txt_gz_path = extracted_dir / f"{pdf_id}.txt.gz"
-                output_pdf_path = outputs_dir / f"{pdf_id}.pdf"
+                out_pdf = outputs_dir / f"{pdf_id}.pdf"
 
-                created_at_ts = upload_time_ts
+                actual_txt = txt_path if txt_path.exists() else (txt_gz_path if txt_gz_path.exists() else None)
 
-                actual_txt_path = txt_path if txt_path.exists() else (txt_gz_path if txt_gz_path.exists() else None)
+                if actual_txt or out_pdf.exists():
+                    completed_src = actual_txt if actual_txt else out_pdf
+                    completed_at_dt = datetime.fromtimestamp(float(completed_src.stat().st_mtime))
 
-                if actual_txt_path or output_pdf_path.exists():
-                    if actual_txt_path:
-                        completed_at_ts = actual_txt_path.stat().st_mtime
-                    else:
-                        completed_at_ts = output_pdf_path.stat().st_mtime
                     pdf_task_status[pdf_id] = {
-                        'status': 'completed',
-                        'created_at': created_at_ts,
-                        'completed_at': completed_at_ts,
-                        'used_ocr': output_pdf_path.exists(),
-                        'extracted_text_path': str(actual_txt_path) if actual_txt_path else None,
-                        'ocr_pdf_path': str(output_pdf_path) if output_pdf_path.exists() else None,
-                        'task_id': None
+                        "status": "completed",
+                        "created_at": created_at_dt,
+                        "completed_at": completed_at_dt,
+                        "used_ocr": bool(out_pdf.exists()),
+                        "extracted_text_path": str(actual_txt) if actual_txt else None,
+                        "ocr_pdf_path": str(out_pdf) if out_pdf.exists() else None,
+                        "task_id": None,
+                        "mode": "local",
+                        "pages": None,
+                        "error": None,
                     }
                 else:
                     pdf_task_status[pdf_id] = {
-                        'status': 'unknown',
-                        'created_at': created_at_ts,
-                        'task_id': None
+                        "status": "unknown",
+                        "created_at": created_at_dt,
+                        "completed_at": None,
+                        "task_id": None,
+                        "mode": "local",
+                        "pages": None,
+                        "used_ocr": False,
+                        "extracted_text_path": None,
+                        "error": None,
                     }
-                logger.info(f"Cargado PDF desde disco: {pdf_file}")
             except Exception as e:
                 logger.exception(f"Error cargando PDF {pdf_file}: {e}")
 
-# Nota: la carga se realizará desde el evento de startup de la aplicación
+def _infer_status_for_base(base_id: str, extracted_dir: Path, outputs_dir: Path) -> dict:
+    txt_path = extracted_dir / f"{base_id}.txt"
+    txt_gz_path = extracted_dir / f"{base_id}.txt.gz"
+    out_pdf = outputs_dir / f"{base_id}.pdf"
 
+    actual_txt = None
+    if txt_path.exists():
+        actual_txt = txt_path
+    elif txt_gz_path.exists():
+        actual_txt = txt_gz_path
+
+    if actual_txt or out_pdf.exists():
+        completed_src = actual_txt if actual_txt else out_pdf
+        return {
+            "status": "completed",
+            "created_at": None,
+            "completed_at": datetime.fromtimestamp(float(completed_src.stat().st_mtime)),
+            "used_ocr": bool(out_pdf.exists()),
+            "extracted_text_path": str(actual_txt) if actual_txt else None,
+            "ocr_pdf_path": str(out_pdf) if out_pdf.exists() else None,
+            "task_id": None,
+            "mode": "local",
+            "pages": None,
+            "error": None,
+        }
+
+    return {
+        "status": "unknown",
+        "created_at": None,
+        "completed_at": None,
+        "used_ocr": False,
+        "extracted_text_path": None,
+        "task_id": None,
+        "mode": "local",
+        "pages": None,
+        "error": None,
+    }
+
+def _scan_docs_root_latest_versions(docs_root: Path) -> dict:
+    """
+    { base_id: {"pdf_path": str, "mtime": float, "size": int, "filename": str} }
+    """
+    latest = {}
+    if not docs_root or not docs_root.exists():
+        return latest
+
+    for folder in docs_root.rglob("*"):
+        if not folder.is_dir():
+            continue
+        base_id = folder.name
+        if not _is_base_id(base_id):
+            continue
+
+        best_pdf = _pick_latest_version_pdf(folder, base_id)
+        if not best_pdf:
+            continue
+
+        st = best_pdf.stat()
+        latest[base_id] = {
+            "pdf_path": str(best_pdf),
+            "mtime": float(st.st_mtime),
+            "size": int(st.st_size),
+            "filename": best_pdf.name,
+        }
+
+    return latest
+
+def _get_docs_root_safe() -> Optional[Path]:
+    """
+    Tu Settings pegado no trae DOCS_ROOT, pero tu router lo usa.
+    Si sí lo tienes en tu proyecto real, esto lo toma.
+    Si no existe, regresamos None y desactivamos versionado.
+    """
+    docs_root_val = getattr(settings, "DOCS_ROOT", None)
+    if not docs_root_val:
+        return None
+    try:
+        return Path(docs_root_val)
+    except Exception:
+        return None
+
+def _ensure_docs_root_in_storage() -> None:
+    docs_root = _get_docs_root_safe()
+    if not docs_root:
+        return
+    latest_map = _scan_docs_root_latest_versions(docs_root)
+    for base_id, info in latest_map.items():
+        if base_id not in pdf_storage:
+            pdf_storage[base_id] = {
+                "filename": f"{base_id}.pdf",
+                "pdf_path": info["pdf_path"],
+                "size": info["size"],
+                "upload_time": info["mtime"],
+                "mode": "local",
+                "task_id": None,
+            }
+
+# =========================
+# Endpoints
+# =========================
 
 @router.post("/upload", response_model=PDFUploadResponse)
 async def upload_pdf(file: UploadFile = File(...), use_ocr: bool = Query(True)):
     """Sube un PDF. Si hay workers, encola en Celery; si no, procesa en hilo local."""
     try:
-        if not file.filename.lower().endswith(".pdf"):
+        if not file.filename or not file.filename.lower().endswith(".pdf"):
             raise HTTPException(status_code=400, detail="Solo se permiten archivos PDF")
 
         file_bytes = await file.read()
+        if not file_bytes:
+            raise HTTPException(status_code=400, detail="Archivo vacío")
+
         pdf_id = pdf_service.generate_pdf_id(file.filename, file_bytes)
         pages_count = pdf_service.get_pdf_pages_count(file_bytes)
 
-        # 1) Guardar PDF
         os.makedirs(settings.UPLOAD_FOLDER, exist_ok=True)
         pdf_path = os.path.join(settings.UPLOAD_FOLDER, f"{pdf_id}.pdf")
         with open(pdf_path, "wb") as f:
@@ -174,7 +327,7 @@ async def upload_pdf(file: UploadFile = File(...), use_ocr: bool = Query(True)):
 
         now = datetime.now()
 
-        # 2) Detectar workers Celery
+        # Detectar workers Celery
         has_workers = False
         try:
             inspector = celery_app.control.inspect()
@@ -183,17 +336,17 @@ async def upload_pdf(file: UploadFile = File(...), use_ocr: bool = Query(True)):
         except Exception:
             has_workers = False
 
-        # 3) Guardar metadatos base
+        # Metadatos
         pdf_storage[pdf_id] = {
             "filename": file.filename,
             "pdf_path": pdf_path,
             "size": len(file_bytes),
-            "upload_time": time.time(),
+            "upload_time": time.time(),  # float
             "pages": pages_count,
             "use_ocr": use_ocr,
         }
 
-        # 4) Si hay workers -> Celery
+        # Celery
         if has_workers:
             task = process_pdf_task.delay(pdf_id=pdf_id, pdf_path=pdf_path, use_ocr=use_ocr)
 
@@ -209,6 +362,7 @@ async def upload_pdf(file: UploadFile = File(...), use_ocr: bool = Query(True)):
                 "ocr_pdf_path": None,
                 "used_ocr": use_ocr,
                 "error": None,
+                "progress": 0,
             }
 
             return PDFUploadResponse(
@@ -218,11 +372,11 @@ async def upload_pdf(file: UploadFile = File(...), use_ocr: bool = Query(True)):
                 task_id=task.id,
                 status="pending",
                 message="PDF encolado para procesamiento (Celery). Usa /upload-status/{pdf_id}.",
-                estimated_wait_time=10.0,
                 pages=pages_count,
+                estimated_wait_time=10.0,
             )
 
-        # 5) Si NO hay workers -> hilo local
+        # Local
         pdf_storage[pdf_id].update({"task_id": None, "mode": "local"})
         pdf_task_status[pdf_id] = {
             "task_id": None,
@@ -235,31 +389,38 @@ async def upload_pdf(file: UploadFile = File(...), use_ocr: bool = Query(True)):
             "ocr_pdf_path": None,
             "used_ocr": use_ocr,
             "error": None,
+            "progress": 0,
         }
 
         def _local_process(pid: str, ppath: str, puse_ocr: bool):
             try:
-                pdf_task_status[pid].update({"status": "processing"})
-                text, pages, used_ocr = pdf_service.extract_text_from_pdf(ppath, use_ocr=puse_ocr)
+                pdf_task_status[pid].update({"status": "processing", "progress": 50})
+                text, pages, used_ocr_ = pdf_service.extract_text_from_pdf(ppath, use_ocr=puse_ocr)
                 text_path = pdf_service.save_extracted_text(text, pid)
 
                 pdf_task_status[pid].update({
                     "status": "completed",
                     "pages": pages,
                     "extracted_text_path": text_path,
-                    "used_ocr": used_ocr,
+                    "used_ocr": used_ocr_,
                     "completed_at": datetime.now(),
                     "error": None,
+                    "progress": 100,
                 })
 
-                # Importante: NO guardes el texto completo en memoria (puede ser gigante)
+                # NO guardar texto completo
                 pdf_storage[pid].update({
                     "pages": pages,
                     "text_path": text_path,
                 })
             except Exception as e:
                 logger.exception(f"Error en procesamiento local {pid}: {e}")
-                pdf_task_status[pid].update({"status": "failed", "error": str(e), "completed_at": datetime.now()})
+                pdf_task_status[pid].update({
+                    "status": "failed",
+                    "error": str(e),
+                    "completed_at": datetime.now(),
+                    "progress": 0,
+                })
 
         threading.Thread(target=_local_process, args=(pdf_id, pdf_path, use_ocr), daemon=True).start()
 
@@ -270,8 +431,8 @@ async def upload_pdf(file: UploadFile = File(...), use_ocr: bool = Query(True)):
             task_id="",
             status="pending",
             message="PDF aceptado y procesando localmente (no hay workers). Usa /upload-status/{pdf_id}.",
-            estimated_wait_time=0.0,
             pages=pages_count,
+            estimated_wait_time=0.0,
         )
 
     except HTTPException:
@@ -288,10 +449,10 @@ async def get_upload_status(pdf_id: str):
     task_id = info.get("task_id")
     mode = info.get("mode") or ("celery" if task_id else "local")
 
-    # 1) Si es local (o no hay task_id), NO consultes Celery
+    # Local (no consultar Celery)
     if mode == "local" or not task_id:
         status = info.get("status", "unknown")
-        progress = 10 if status == "pending" else 50 if status == "processing" else 100 if status == "completed" else 0
+        progress = int(info.get("progress") or (10 if status == "pending" else 50 if status == "processing" else 100 if status == "completed" else 0))
 
         return PDFUploadStatus(
             pdf_id=pdf_id,
@@ -300,14 +461,13 @@ async def get_upload_status(pdf_id: str):
             progress=progress,
             pages=info.get("pages"),
             extracted_text_path=info.get("extracted_text_path"),
-            ocr_pdf_path=info.get("ocr_pdf_path"),
             used_ocr=info.get("used_ocr"),
             error=info.get("error"),
             created_at=info.get("created_at"),
             completed_at=info.get("completed_at"),
         )
 
-    # 2) Si es celery, consulta Celery
+    # Celery
     task = celery_app.AsyncResult(task_id)
     status_map = {
         "PENDING": "pending",
@@ -316,7 +476,7 @@ async def get_upload_status(pdf_id: str):
         "SUCCESS": "completed",
         "FAILURE": "failed",
     }
-    current_status = status_map.get(task.state, task.state.lower())
+    current_status = status_map.get(task.state, (task.state or "unknown").lower())
 
     if task.state == "SUCCESS" and isinstance(task.result, dict):
         result = task.result
@@ -330,7 +490,14 @@ async def get_upload_status(pdf_id: str):
             "completed_at": datetime.now(),
             "error": None,
             "mode": "celery",
+            "progress": 100,
         })
+        pdf_storage.get(pdf_id, {}).update({
+            "pages": result.get("pages"),
+            "text_path": result.get("text_path"),
+            "completed": True,
+        })
+
     elif task.state == "FAILURE":
         err = str(task.info) if task.info else "Error desconocido"
         pdf_task_status[pdf_id].update({
@@ -338,6 +505,7 @@ async def get_upload_status(pdf_id: str):
             "error": err,
             "completed_at": datetime.now(),
             "mode": "celery",
+            "progress": 0,
         })
 
     final = pdf_task_status[pdf_id]
@@ -350,7 +518,6 @@ async def get_upload_status(pdf_id: str):
         progress=progress,
         pages=final.get("pages"),
         extracted_text_path=final.get("extracted_text_path"),
-        ocr_pdf_path=final.get("ocr_pdf_path"),
         used_ocr=final.get("used_ocr"),
         error=final.get("error"),
         created_at=final.get("created_at"),
@@ -359,22 +526,40 @@ async def get_upload_status(pdf_id: str):
 
 @router.post("/{pdf_id}/search", response_model=SearchResponse)
 async def search_pdf(pdf_id: str, search_request: SearchRequest):
-    if pdf_id not in pdf_storage:
+    if pdf_id not in pdf_storage and pdf_id not in pdf_task_status:
         raise HTTPException(status_code=404, detail="PDF no encontrado")
-    
+
     start_time = time.time()
-    pdf_data = pdf_storage[pdf_id]
-    text = pdf_data['text']
-    
+
+    meta = pdf_storage.get(pdf_id, {})
+    ts = pdf_task_status.get(pdf_id, {})
+
+    extracted_dir = Path(settings.EXTRACTED_FOLDER)
+
+    # Prioridad: status -> storage -> inferred
+    text_path = ts.get("extracted_text_path") or meta.get("text_path")
+    if not text_path or not os.path.exists(str(text_path)):
+        candidate_txt = extracted_dir / f"{pdf_id}.txt"
+        candidate_gz = extracted_dir / f"{pdf_id}.txt.gz"
+        if candidate_txt.exists():
+            text_path = str(candidate_txt)
+        elif candidate_gz.exists():
+            text_path = str(candidate_gz)
+
+    text = _load_text_from_file(str(text_path)) if text_path else ""
+    if not text:
+        raise HTTPException(status_code=404, detail="Texto no encontrado para este PDF")
+
+    # Tu SearchRequest trae use_regex pero tu PDFService decide si lo soporta o no.
     results = pdf_service.search_in_text(
-        text, 
-        search_request.term, 
+        text,
+        search_request.term,
         search_request.case_sensitive
     )
-    
+
     limited_results = results[:100]
     execution_time = time.time() - start_time
-    
+
     return SearchResponse(
         term=search_request.term,
         total_matches=len(results),
@@ -385,154 +570,140 @@ async def search_pdf(pdf_id: str, search_request: SearchRequest):
 
 @router.get("/{pdf_id}/text")
 async def get_pdf_text(pdf_id: str):
-    if pdf_id not in pdf_storage:
+    if pdf_id not in pdf_storage and pdf_id not in pdf_task_status:
         raise HTTPException(status_code=404, detail="PDF no encontrado")
-    
-    # Verificar estado del PDF — preferir la fuente `pdf_task_status` cuando exista
+
     pdf_data = pdf_storage.get(pdf_id, {})
     task_status = pdf_task_status.get(pdf_id, {})
-    # Si hay task_id, refrescar estado consultando Celery (asegura que endpoints vean cambios)
-    task_id = task_status.get('task_id') or pdf_data.get('task_id')
-    if task_id:
+
+    task_id = task_status.get("task_id") or pdf_data.get("task_id")
+    mode = task_status.get("mode") or pdf_data.get("mode") or ("celery" if task_id else "local")
+
+    # refrescar Celery si aplica
+    if mode == "celery" and task_id:
         try:
             task = celery_app.AsyncResult(task_id)
-            # Si la tarea terminó correctamente, actualizar pdf_task_status en memoria
-            if task.state == 'SUCCESS' and isinstance(task.result, dict):
+            if task.state == "SUCCESS" and isinstance(task.result, dict):
                 result = task.result
                 pdf_task_status[pdf_id] = pdf_task_status.get(pdf_id, {})
                 pdf_task_status[pdf_id].update({
-                    'status': 'completed',
-                    'pages': result.get('pages'),
-                    'extracted_text_path': result.get('text_path'),
-                    'ocr_pdf_path': result.get('pdf_path'),
-                    'used_ocr': result.get('used_ocr'),
-                    'text_length': result.get('text_length'),
-                    'completed_at': datetime.now(),
-                    'error': None,
-                    'task_id': task_id
+                    "status": "completed",
+                    "pages": result.get("pages"),
+                    "extracted_text_path": result.get("text_path"),
+                    "ocr_pdf_path": result.get("pdf_path"),
+                    "used_ocr": result.get("used_ocr"),
+                    "text_length": result.get("text_length"),
+                    "completed_at": datetime.now(),
+                    "error": None,
+                    "task_id": task_id,
+                    "mode": "celery",
+                    "progress": 100,
                 })
-
                 if pdf_id in pdf_storage:
                     pdf_storage[pdf_id].update({
-                        'pages': result.get('pages'),
-                        'text_path': result.get('text_path'),
-                        'completed': True,
-                        'text': pdf_storage.get(pdf_id, {}).get('text', '')
+                        "pages": result.get("pages"),
+                        "text_path": result.get("text_path"),
+                        "completed": True,
                     })
-
-            elif task.state == 'FAILURE':
+            elif task.state == "FAILURE":
                 pdf_task_status[pdf_id] = pdf_task_status.get(pdf_id, {})
                 pdf_task_status[pdf_id].update({
-                    'status': 'failed',
-                    'error': str(task.info) if task.info else 'Error desconocido',
-                    'completed_at': datetime.now(),
-                    'task_id': task_id
+                    "status": "failed",
+                    "error": str(task.info) if task.info else "Error desconocido",
+                    "completed_at": datetime.now(),
+                    "task_id": task_id,
+                    "mode": "celery",
+                    "progress": 0,
                 })
         except Exception:
             logger.exception(f"No se pudo consultar estado Celery para task {task_id}")
 
-    current_status = pdf_task_status.get(pdf_id, {}).get('status') or pdf_data.get('status')
-
-    # Si el PDF aún está pendiente, devolver estado
-    if current_status == 'pending' or (not current_status and task_status):
-        return JSONResponse(
-            status_code=202,  # Accepted - aún procesando
-            content={
-                'status': 'pending',
-                'message': 'PDF aún está siendo procesado',
-                'task_id': task_status.get('task_id') or pdf_data.get('task_id'),
-                'progress': task_status.get('progress', pdf_data.get('progress', 0))
-            }
-        )
-
-    # Si hay error, devolverlo
-    if current_status == 'failed':
-        return JSONResponse(
-            status_code=400,
-            content={
-                'status': 'failed',
-                'message': 'Error al procesar PDF',
-                'error': task_status.get('error') or pdf_data.get('error')
-            }
-        )
-
-    # Si el PDF está completado, devolver el texto (buscar en pdf_task_status o pdf_storage)
-    text_path = task_status.get('extracted_text_path') or pdf_data.get('text_path')
-    if text_path and os.path.exists(text_path):
-        return FileResponse(
-            text_path, 
-            media_type='text/plain',
-            filename=f"{pdf_id}_texto.txt"
-        )
-    else:
-        raise HTTPException(status_code=404, detail="Texto no encontrado")
-    
-@router.get("/{pdf_id}/searchable-pdf")
-async def get_searchable_pdf(pdf_id: str):
-    # Intentamos obtener de task_status primero
-    task_status = pdf_task_status.get(pdf_id, {})
-    
-    # Fallback: si no está en task_status pero sí en storage
-    if not task_status and pdf_id in pdf_storage:
-        logger.warning(f"pdf_id {pdf_id} encontrado solo en pdf_storage (fallback)")
-        # Creamos una entrada mínima en task_status para no fallar
-        pdf_task_status[pdf_id] = {
-            "task_id": pdf_storage[pdf_id].get("task_id"),
-            "status": pdf_storage[pdf_id].get("status", "unknown"),
-            "ocr_pdf_path": os.path.join(settings.OUTPUTS_FOLDER, f"{pdf_id}.pdf"),
-            "created_at": pdf_storage[pdf_id].get("upload_time")
-        }
-        task_status = pdf_task_status[pdf_id]
-
-    if not task_status:
-        raise HTTPException(status_code=404, detail="ID de PDF no reconocido")
-
-    # Refrescar estado desde Celery si hay task_id
-    task_id = task_status.get('task_id') or pdf_storage.get(pdf_id, {}).get('task_id')
-    if task_id:
-        try:
-            task = celery_app.AsyncResult(task_id)
-            if task.state == 'SUCCESS' and isinstance(task.result, dict):
-                result = task.result
-                pdf_task_status[pdf_id] = pdf_task_status.get(pdf_id, {})
-                pdf_task_status[pdf_id].update({
-                    'status': 'completed',
-                    'pages': result.get('pages'),
-                    'extracted_text_path': result.get('text_path'),
-                    'ocr_pdf_path': result.get('pdf_path'),
-                    'used_ocr': result.get('used_ocr'),
-                    'text_length': result.get('text_length'),
-                    'completed_at': datetime.now(),
-                    'error': None,
-                    'task_id': task_id
-                })
-                if pdf_id in pdf_storage:
-                    pdf_storage[pdf_id].update({
-                        'pages': result.get('pages'),
-                        'text_path': result.get('text_path'),
-                        'completed': True
-                    })
-            elif task.state == 'FAILURE':
-                pdf_task_status[pdf_id] = pdf_task_status.get(pdf_id, {})
-                pdf_task_status[pdf_id].update({
-                    'status': 'failed',
-                    'error': str(task.info) if task.info else 'Error desconocido',
-                    'completed_at': datetime.now(),
-                    'task_id': task_id
-                })
-        except Exception:
-            logger.exception(f"No se pudo consultar estado Celery para task {task_id}")
-
-    current_status = pdf_task_status.get(pdf_id, {}).get("status", pdf_storage.get(pdf_id, {}).get('status', 'unknown'))
+    current_status = pdf_task_status.get(pdf_id, {}).get("status") or pdf_data.get("status")
 
     if current_status in ("pending", "processing"):
         return JSONResponse(
             status_code=202,
             content={
                 "status": current_status,
+                "message": "PDF aún está siendo procesado",
+                "task_id": task_status.get("task_id") or pdf_data.get("task_id") or "",
+                "progress": int(task_status.get("progress") or 0),
+            }
+        )
+
+    if current_status == "failed":
+        return JSONResponse(
+            status_code=400,
+            content={
+                "status": "failed",
+                "message": "Error al procesar PDF",
+                "error": task_status.get("error") or pdf_data.get("error"),
+            }
+        )
+
+    extracted_dir = Path(settings.EXTRACTED_FOLDER)
+    text_path = task_status.get("extracted_text_path") or pdf_data.get("text_path")
+
+    if not text_path or not os.path.exists(str(text_path)):
+        candidate_txt = extracted_dir / f"{pdf_id}.txt"
+        candidate_gz = extracted_dir / f"{pdf_id}.txt.gz"
+        if candidate_txt.exists():
+            text_path = str(candidate_txt)
+        elif candidate_gz.exists():
+            text_path = str(candidate_gz)
+
+    if text_path and os.path.exists(str(text_path)):
+        return FileResponse(str(text_path), media_type="text/plain", filename=f"{pdf_id}_texto.txt")
+
+    raise HTTPException(status_code=404, detail="Texto no encontrado")
+
+@router.get("/{pdf_id}/searchable-pdf")
+async def get_searchable_pdf(pdf_id: str):
+    outputs_dir = Path(settings.OUTPUTS_FOLDER)
+
+    docs_root = _get_docs_root_safe()
+
+    # Caso A: base_id (versionado)
+    if _is_base_id(pdf_id):
+        if not docs_root:
+            raise HTTPException(status_code=400, detail="DOCS_ROOT no está configurado en settings")
+        latest_map = _scan_docs_root_latest_versions(docs_root)
+        info = latest_map.get(pdf_id)
+        if not info:
+            raise HTTPException(status_code=404, detail="No se encontró ninguna versión para ese base_id")
+
+        pdf_path = info["pdf_path"]
+        if not os.path.exists(pdf_path):
+            raise HTTPException(status_code=404, detail="Archivo no encontrado en DOCS_ROOT")
+
+        return FileResponse(pdf_path, media_type="application/pdf", filename=f"{pdf_id}.pdf")
+
+    # Caso B: flujo normal (outputs por id)
+    task_status = pdf_task_status.get(pdf_id, {})
+    if not task_status and pdf_id in pdf_storage:
+        pdf_task_status[pdf_id] = {
+            "task_id": pdf_storage[pdf_id].get("task_id"),
+            "status": pdf_storage[pdf_id].get("status", "unknown"),
+            "ocr_pdf_path": str(outputs_dir / f"{pdf_id}.pdf"),
+            "created_at": datetime.fromtimestamp(float(pdf_storage[pdf_id].get("upload_time", time.time()))),
+            "mode": pdf_storage[pdf_id].get("mode") or ("celery" if pdf_storage[pdf_id].get("task_id") else "local"),
+            "used_ocr": False,
+            "error": None,
+        }
+        task_status = pdf_task_status[pdf_id]
+
+    if not task_status:
+        raise HTTPException(status_code=404, detail="ID de PDF no reconocido")
+
+    current_status = task_status.get("status", "unknown")
+    if current_status in ("pending", "processing"):
+        return JSONResponse(
+            status_code=202,
+            content={
+                "status": current_status,
                 "message": "El PDF aún se está procesando",
-                "task_id": task_status.get("task_id"),
-                "progress": task_status.get("progress", 0)
+                "task_id": task_status.get("task_id") or "",
+                "progress": int(task_status.get("progress") or 0),
             }
         )
 
@@ -542,85 +713,51 @@ async def get_searchable_pdf(pdf_id: str):
             content={
                 "status": "failed",
                 "message": "El proceso de OCR falló",
-                "error": task_status.get("error", "Sin detalles")
+                "error": task_status.get("error", "Sin detalles"),
             }
         )
 
-    # Ruta del PDF con OCR
-    ocr_pdf_path = task_status.get("ocr_pdf_path") or os.path.join(
-        settings.OUTPUTS_FOLDER, f"{pdf_id}.pdf"
-    )
+    ocr_pdf_path = task_status.get("ocr_pdf_path") or str(outputs_dir / f"{pdf_id}.pdf")
+    if not os.path.exists(str(ocr_pdf_path)):
+        raise HTTPException(status_code=404, detail="El archivo OCR no existe en outputs")
 
-    if not os.path.exists(ocr_pdf_path):
-        logger.error(f"Archivo OCR no encontrado: {ocr_pdf_path}")
-        raise HTTPException(
-            status_code=404,
-            detail="El archivo OCR no se encuentra en la carpeta outputs"
-        )
-
-    return FileResponse(
-        ocr_pdf_path,
-        media_type="application/pdf",
-        filename=f"{pdf_id}_searchable.pdf"
-    )
-
+    return FileResponse(str(ocr_pdf_path), media_type="application/pdf", filename=f"{pdf_id}_searchable.pdf")
 
 @router.post("/merge-with-output")
 async def merge_with_output(
-    first_pdf_id: str = Query(..., description="ID del PDF ya procesado en outputs"),
+    first_pdf_id: str = Query(..., description="Ruta relativa dentro de DOCS_ROOT (ej: 01/01/.../archivo.pdf)"),
     file: UploadFile = File(...),
     use_ocr: bool = Query(True),
     position: str = Query("end", description="Dónde insertar el segundo PDF: 'start' o 'end'")
 ):
     """
-    Recibe un PDF ya procesado (referido por `first_pdf_id` en outputs) y un segundo PDF sin procesar.
-    Procesa el segundo con OCRmyPDF, guarda sus textos y luego une ambos PDFs en `outputs`.
-    Devuelve el PDF combinado.
+    Une un PDF existente dentro de DOCS_ROOT (ruta relativa) + un PDF subido.
+    Procesa el segundo con OCRmyPDF, extrae texto, une y deja resultado en OUTPUTS_FOLDER.
     """
     try:
-        # Verificar que el primer PDF procesado exista en outputs para desarrolllo ---Versoon para windows 
-        # first_path = os.path.join(settings.OUTPUTS_FOLDER, f"{first_pdf_id}.pdf")
-        # Extraer partes del ID
-        # first_pdf_id ahora viene como ruta relativa:
-        # 01/01/5555_01_11_03_999_C/archivo.pdf
+        docs_root = _get_docs_root_safe()
+        if not docs_root:
+            raise HTTPException(status_code=400, detail="DOCS_ROOT no está configurado en settings")
 
-        first_path = os.path.join("/data/docs", first_pdf_id)
+        first_path = _safe_join_under_root(docs_root, first_pdf_id)
+        if not first_path.exists() or not first_path.is_file() or first_path.suffix.lower() != ".pdf":
+            raise HTTPException(status_code=404, detail=f"PDF no encontrado: {first_pdf_id}")
 
-        # Normalizar la ruta por seguridad
-        first_path = os.path.abspath(first_path)
-
-        # Validar que realmente esté dentro de /data/docs
-        if not first_path.startswith("/data/docs"):
-            raise HTTPException(status_code=400, detail="Ruta inválida")
-
-        if not os.path.exists(first_path):
-            raise HTTPException(
-                status_code=404,
-                detail=f"PDF no encontrado: {first_path}"
-            )
-
-
-        if not os.path.exists(first_path):
-            raise HTTPException(
-                status_code=404,
-                detail=f"PDF no encontrado en producción: {first_path}"
-            )
-
-        if not os.path.exists(first_path):
-            raise HTTPException(status_code=404, detail="Primer PDF procesado no encontrado en outputs")
-
-        # Guardar el segundo PDF temporalmente
         file_bytes = await file.read()
-        second_id = pdf_service.generate_pdf_id(file.filename, file_bytes)
-        uploads_dir = settings.UPLOAD_FOLDER
-        os.makedirs(uploads_dir, exist_ok=True)
-        second_path = os.path.join(uploads_dir, f"{second_id}.pdf")
-        with open(second_path, "wb") as f:
-            f.write(file_bytes)
+        if not file_bytes:
+            raise HTTPException(status_code=400, detail="Archivo vacío")
 
-        # Aplicar OCR al segundo PDF (sin Celery, síncrono) usando ocrmypdf
-        os.makedirs(settings.OUTPUTS_FOLDER, exist_ok=True)
-        ocr_second_output = os.path.join(settings.OUTPUTS_FOLDER, f"{second_id}.pdf")
+        second_id = pdf_service.generate_pdf_id(file.filename, file_bytes)
+
+        uploads_dir = Path(settings.UPLOAD_FOLDER)
+        uploads_dir.mkdir(parents=True, exist_ok=True)
+        second_path = uploads_dir / f"{second_id}.pdf"
+        second_path.write_bytes(file_bytes)
+
+        outputs_dir = Path(settings.OUTPUTS_FOLDER)
+        outputs_dir.mkdir(parents=True, exist_ok=True)
+
+        ocr_second_output = outputs_dir / f"{second_id}.pdf"
 
         command = [
             sys.executable, "-m", "ocrmypdf",
@@ -629,68 +766,78 @@ async def merge_with_output(
             "--optimize", "0",
             "--output-type", "pdf",
             "--jpeg-quality", "100",
-            second_path,
-            ocr_second_output
+            str(second_path),
+            str(ocr_second_output),
         ]
 
         result = subprocess.run(command, capture_output=True, text=True, check=False)
-        if result.returncode != 0 or not os.path.exists(ocr_second_output):
-            # limpiar temporal
-            if os.path.exists(second_path):
-                os.remove(second_path)
+        if result.returncode != 0 or not ocr_second_output.exists():
+            try:
+                if second_path.exists():
+                    second_path.unlink()
+            except Exception:
+                pass
             raise HTTPException(status_code=500, detail=f"OCRmyPDF falló: {result.stderr.strip()}")
 
-        # Extraer texto del segundo y guardar
-        text, pages, used_ocr = pdf_service.extract_text_from_pdf(second_path, use_ocr=use_ocr)
+        text, pages, used_ocr_ = pdf_service.extract_text_from_pdf(str(second_path), use_ocr=use_ocr)
         text_path = pdf_service.save_extracted_text(text, second_id)
 
-        # Actualizar metadatos en memoria
         now = datetime.now()
         pdf_storage[second_id] = {
-            'filename': file.filename,
-            'pdf_path': second_path,
-            'size': len(file_bytes),
-            'upload_time': time.time(),
-            'task_id': None,
-            'use_ocr': use_ocr,
-            'pages': pages,
-            'text_path': text_path
+            "filename": file.filename,
+            "pdf_path": str(second_path),
+            "size": len(file_bytes),
+            "upload_time": time.time(),
+            "task_id": None,
+            "use_ocr": use_ocr,
+            "pages": pages,
+            "text_path": text_path,
+            "mode": "local",
         }
         pdf_task_status[second_id] = {
-            'task_id': None,
-            'status': 'completed',
-            'created_at': now,
-            'completed_at': datetime.now(),
-            'pages': pages,
-            'extracted_text_path': text_path,
-            'ocr_pdf_path': ocr_second_output,
-            'used_ocr': used_ocr,
-            'text_length': len(text)
+            "task_id": None,
+            "status": "completed",
+            "created_at": now,
+            "completed_at": datetime.now(),
+            "pages": pages,
+            "extracted_text_path": text_path,
+            "ocr_pdf_path": str(ocr_second_output),
+            "used_ocr": used_ocr_,
+            "text_length": len(text),
+            "mode": "local",
+            "error": None,
+            "progress": 100,
         }
 
-        # Unir PDFs (primero procesado + segundo procesado)
-        # merged_id = f"{first_pdf_id}_{second_id}_merged"
         merged_id = f"{first_pdf_id.replace('/', '_')}_{second_id}_merged"
-        merged_output = os.path.join(settings.OUTPUTS_FOLDER,f"{merged_id}.pdf")
-        # merged_output = os.path.join(settings.OUTPUTS_FOLDER, f"{merged_id}.pdf")
-        merged_path = pdf_service.merge_pdfs([first_path, ocr_second_output], merged_output, position=position)
-    
-        # Guardar metadatos del PDF combinado
+        merged_output = outputs_dir / f"{merged_id}.pdf"
+
+        merged_path = pdf_service.merge_pdfs(
+            [str(first_path), str(ocr_second_output)],
+            str(merged_output),
+            position=position,
+        )
+
         pdf_storage[merged_id] = {
-            'filename': f"{merged_id}.pdf",
-            'pdf_path': merged_path,
-            'size': os.path.getsize(merged_path),
-            'upload_time': time.time()
+            "filename": f"{merged_id}.pdf",
+            "pdf_path": merged_path,
+            "size": os.path.getsize(merged_path),
+            "upload_time": time.time(),
+            "mode": "local",
+            "task_id": None,
         }
         pdf_task_status[merged_id] = {
-            'task_id': None,
-            'status': 'completed',
-            'created_at': now,
-            'completed_at': datetime.now(),
-            'pages': (pdf_task_status.get(first_pdf_id, {}).get('pages') or 0) + pages,
-            'extracted_text_path': None,
-            'ocr_pdf_path': merged_path,
-            'used_ocr': True
+            "task_id": None,
+            "status": "completed",
+            "created_at": now,
+            "completed_at": datetime.now(),
+            "pages": pages,
+            "extracted_text_path": None,
+            "ocr_pdf_path": merged_path,
+            "used_ocr": True,
+            "mode": "local",
+            "error": None,
+            "progress": 100,
         }
 
         return FileResponse(merged_path, media_type="application/pdf", filename=f"{merged_id}.pdf")
@@ -700,281 +847,235 @@ async def merge_with_output(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error en merge: {str(e)}")
 
-@router.get("/{pdf_id}/info", response_model=PDFInfo)
-async def get_pdf_info(pdf_id: str):
-    if pdf_id not in pdf_storage:
-        raise HTTPException(status_code=404, detail="PDF no encontrado")
-    
-    pdf_data = pdf_storage[pdf_id]
-    text_file_size = None
-    text_path = pdf_data.get('text_path')
-    if text_path and os.path.exists(text_path):
-        text_file_size = os.path.getsize(text_path)
-    
-    return PDFInfo(
-        id=pdf_id,
-        filename=pdf_data['filename'],
-        upload_date=datetime.fromtimestamp(pdf_data['upload_time']),
-        size=pdf_data['size'],
-        pages=pdf_data.get('pages'),  # Puede ser None si aún se procesa
-        has_text=bool(pdf_data.get('text', '').strip()),
-        text_file_size=text_file_size
-    )
-
 @router.get("/list", response_model=PDFListResponse)
 async def list_pdfs():
     """
-    Devuelve la lista de todos los PDFs con su estado de procesamiento.
-    Útil para ver qué PDFs están en cola, en proceso o completados.
+    Devuelve PDFs filtrados por nomenclatura.
+    - created_at/completed_at son datetime (como tu schema).
+    - upload_time es float (como tu schema).
+    - Si existe DOCS_ROOT, agrega base_id con versión latest (sin duplicar versiones).
     """
-    # ========== AGREGAR: Cargar PDFs existentes en disco ==========
-    def load_existing_pdfs():
-        uploads_dir = Path("uploads")
-        if not uploads_dir.exists():
-            return
-            
-        for pdf_file in uploads_dir.glob("*.pdf"):
-            pdf_id = pdf_file.stem
-            
-            # Solo agregar si no existe
-            if pdf_id not in pdf_storage:
-                # Convertir datetime a timestamp (float) para Pydantic
-                upload_time_dt = datetime.fromtimestamp(pdf_file.stat().st_mtime)
-                upload_time_ts = upload_time_dt.timestamp()
-                
-                pdf_storage[pdf_id] = {
-                    'filename': pdf_file.name,
-                    'size': pdf_file.stat().st_size,
-                    'upload_time': upload_time_ts  # TIMESTAMP en lugar de datetime
-                }
-                
-                # Determinar estado basado en archivos
-                txt_path = Path("extracted_texts") / f"{pdf_id}.txt"
-                output_pdf_path = Path("outputs") / f"{pdf_id}.pdf"
-                
-                # Convertir datetime a timestamp para created_at y completed_at
-                created_at_dt = datetime.fromtimestamp(pdf_file.stat().st_mtime)
-                created_at_ts = created_at_dt.timestamp()
-                
-                if txt_path.exists() or output_pdf_path.exists():
-                    # Usar timestamp de modificación del txt o output
-                    if txt_path.exists():
-                        completed_at_ts = txt_path.stat().st_mtime
-                    else:
-                        completed_at_ts = output_pdf_path.stat().st_mtime
-                    
-                    pdf_task_status[pdf_id] = {
-                        'status': 'completed',
-                        'created_at': created_at_ts,  # TIMESTAMP
-                        'completed_at': completed_at_ts,  # TIMESTAMP
-                        'used_ocr': output_pdf_path.exists(),
-                        'extracted_text_path': str(txt_path) if txt_path.exists() else None
-                    }
-                else:
-                    # PDF subido pero no procesado
-                    pdf_task_status[pdf_id] = {
-                        'status': 'unknown',
-                        'created_at': created_at_ts  # TIMESTAMP
-                    }
-    # ========== FIN DE LA PARTE AGREGADA ==========
-    
-    # Llamar a la función para cargar PDFs existentes
-    load_existing_pdfs()
-    
-    pdfs_list = []
+    # cargar flujo normal desde disco (si no se hace en startup)
+    try:
+        load_existing_pdfs()
+    except Exception:
+        logger.exception("No se pudo cargar PDFs existentes desde disco")
 
-    for pdf_id, data in pdf_storage.items():
-        # Solo incluir PDFs que cumplan la nomenclatura
+    extracted_dir = Path(settings.EXTRACTED_FOLDER)
+    outputs_dir = Path(settings.OUTPUTS_FOLDER)
+
+    pdfs_list: list[Dict[str, Any]] = []
+
+    # 1) Versionados (si existe DOCS_ROOT)
+    docs_root = _get_docs_root_safe()
+    latest_map = _scan_docs_root_latest_versions(docs_root) if docs_root else {}
+
+    for base_id, info in latest_map.items():
+        if not _name_matches_nomenclature(base_id, {"filename": base_id}):
+            continue
+
+        ts = pdf_task_status.get(base_id)
+        if not ts:
+            ts = _infer_status_for_base(base_id, extracted_dir, outputs_dir)
+
+        status = ts.get("status", "unknown")
+        progress = 100 if status == "completed" else 50 if status == "processing" else 0
+
+        size_bytes = int(info["size"])
+        size_mb = round(size_bytes / (1024 * 1024), 2)
+
+        # Para base_id no tenemos "created_at" real del proceso; dejamos None o inferido si existe
+        created_at = ts.get("created_at")
+        completed_at = ts.get("completed_at")
+
+        pdfs_list.append({
+            "id": base_id,
+            "filename": f"{base_id}.pdf",
+            "size_bytes": size_bytes,
+            "size_mb": size_mb,
+            "status": status if status in ("completed", "processing", "pending", "failed") else "pending",
+            "progress": progress,
+            "pages": ts.get("pages"),
+            "task_id": ts.get("task_id") or "",
+            "upload_time": float(info["mtime"]),
+            "created_at": created_at if isinstance(created_at, datetime) else None,
+            "completed_at": completed_at if isinstance(completed_at, datetime) else None,
+            "extracted_text_path": ts.get("extracted_text_path"),
+            "used_ocr": bool(ts.get("used_ocr", False)),
+            "error": ts.get("error"),
+        })
+
+        # sync en storage para que global-search lo vea
+        if base_id not in pdf_storage:
+            pdf_storage[base_id] = {
+                "filename": f"{base_id}.pdf",
+                "pdf_path": info["pdf_path"],
+                "size": size_bytes,
+                "upload_time": float(info["mtime"]),
+                "mode": "local",
+                "task_id": None,
+            }
+
+    # 2) Flujo normal (pdf_storage)
+    for pdf_id, data in list(pdf_storage.items()):
+        if pdf_id in latest_map:
+            continue
         if not _name_matches_nomenclature(pdf_id, data):
             continue
 
-        # Obtener estado de procesamiento
-        task_status_info = pdf_task_status.get(pdf_id, {})
-        status = task_status_info.get('status', 'unknown')
-        task_id = task_status_info.get('task_id')
-        
-        # Si el PDF aún se está procesando, consultar estado real en Celery
-        if status == 'pending' and task_id:
+        ts = pdf_task_status.get(pdf_id, {})
+        status = ts.get("status", "unknown")
+        task_id = ts.get("task_id")
+        mode = ts.get("mode") or data.get("mode") or ("celery" if task_id else "local")
+
+        # Celery: refrescar si está pending
+        if mode == "celery" and status == "pending" and task_id:
             task = celery_app.AsyncResult(task_id)
-            if task.state == 'STARTED':
-                status = 'processing'
-            elif task.state == 'SUCCESS':
-                status = 'completed'
-            elif task.state == 'FAILURE':
-                status = 'failed'
-        
-        # Calcular progreso basado en estado
-        if status == 'completed':
-            progress = 100
-        elif status == 'processing':
-            progress = 50
-        elif status == 'failed':
-            progress = 0
-        else:  # pending, unknown
-            progress = 0
-        
-        # Calcular tamaño en MB
-        size_mb = round(data['size'] / (1024 * 1024), 2)
-        
-        # Obtener valores asegurando tipos correctos para Pydantic
-        task_id_val = task_id if task_id else ""
-        
-        # Para campos datetime, asegurarse de que son timestamps (float) o None
-        upload_time_val = data.get('upload_time')
-        created_at_val = task_status_info.get('created_at')
-        completed_at_val = task_status_info.get('completed_at')
-        
-        # Si los valores son datetime, convertirlos a timestamp
-        if isinstance(upload_time_val, datetime):
-            upload_time_val = upload_time_val.timestamp()
-        if isinstance(created_at_val, datetime):
-            created_at_val = created_at_val.timestamp()
-        if isinstance(completed_at_val, datetime):
-            completed_at_val = completed_at_val.timestamp()
-        
+            if task.state == "STARTED":
+                status = "processing"
+            elif task.state == "SUCCESS":
+                status = "completed"
+            elif task.state == "FAILURE":
+                status = "failed"
+
+        progress = 100 if status == "completed" else 50 if status == "processing" else 0
+
+        size_bytes = int(data.get("size", 0))
+        size_mb = round(size_bytes / (1024 * 1024), 2)
+
+        created_at = ts.get("created_at")
+        completed_at = ts.get("completed_at")
+
         pdfs_list.append({
             "id": pdf_id,
-            "filename": data['filename'],
-            "size_bytes": data['size'],
+            "filename": data.get("filename", f"{pdf_id}.pdf"),
+            "size_bytes": size_bytes,
             "size_mb": size_mb,
-            "status": status,
-            "progress": progress,
-            "pages": task_status_info.get('pages'),
-            "task_id": task_id_val,  # Siempre string, nunca None
-            "upload_time": upload_time_val,  # timestamp float
-            "created_at": created_at_val,  # timestamp float o None
-            "completed_at": completed_at_val,  # timestamp float o None
-            "extracted_text_path": task_status_info.get('extracted_text_path'),
-            "used_ocr": task_status_info.get('used_ocr', False),
-            "error": task_status_info.get('error')
+            "status": status if status in ("completed", "processing", "pending", "failed") else "pending",
+            "progress": int(progress),
+            "pages": ts.get("pages"),
+            "task_id": task_id or "",
+            "upload_time": float(data.get("upload_time", time.time())),
+            "created_at": created_at if isinstance(created_at, datetime) else None,
+            "completed_at": completed_at if isinstance(completed_at, datetime) else None,
+            "extracted_text_path": ts.get("extracted_text_path"),
+            "used_ocr": bool(ts.get("used_ocr", False)),
+            "error": ts.get("error"),
         })
-    
-    # Agrupar por estado para facilitar visualización
-    by_status = {
-        'completed': [p for p in pdfs_list if p['status'] == 'completed'],
-        'processing': [p for p in pdfs_list if p['status'] == 'processing'],
-        'pending': [p for p in pdfs_list if p['status'] == 'pending'],
-        'failed': [p for p in pdfs_list if p['status'] == 'failed'],
+
+    # Ordenar por upload_time desc
+    pdfs_list.sort(key=lambda x: x.get("upload_time", 0), reverse=True)
+
+    by_status_lists = {
+        "completed": [p for p in pdfs_list if p["status"] == "completed"],
+        "processing": [p for p in pdfs_list if p["status"] == "processing"],
+        "pending": [p for p in pdfs_list if p["status"] == "pending"],
+        "failed": [p for p in pdfs_list if p["status"] == "failed"],
     }
-    
+
     return {
         "total": len(pdfs_list),
         "by_status": {
-            "completed": len(by_status['completed']),
-            "processing": len(by_status['processing']),
-            "pending": len(by_status['pending']),
-            "failed": len(by_status['failed'])
+            "completed": len(by_status_lists["completed"]),
+            "processing": len(by_status_lists["processing"]),
+            "pending": len(by_status_lists["pending"]),
+            "failed": len(by_status_lists["failed"]),
         },
         "pdfs": pdfs_list,
-        "summary": {
-            "completed": by_status['completed'],
-            "processing": by_status['processing'],
-            "pending": by_status['pending'],
-            "failed": by_status['failed']
-        }
+        "summary": by_status_lists,
     }
+
 @router.get("/dashboard")
 async def get_dashboard():
     """
-    Dashboard visual amigable para ver el estado de los PDFs.
-    Devuelve información legible para los usuarios.
+    Dashboard simple.
     """
     pdfs_info = []
-    
+
     for pdf_id, data in pdf_storage.items():
-        task_status_info = pdf_task_status.get(pdf_id, {})
-        status = task_status_info.get('status', 'unknown')
-        task_id = task_status_info.get('task_id')
-        
-        # Consultar estado real en Celery
-        if task_id:
+        ts = pdf_task_status.get(pdf_id, {})
+        status = ts.get("status", "unknown")
+        task_id = ts.get("task_id")
+        mode = ts.get("mode") or data.get("mode") or ("celery" if task_id else "local")
+
+        if mode == "celery" and task_id:
             task = celery_app.AsyncResult(task_id)
-            if task.state == 'STARTED':
-                status = 'processing'
-                status_display = "⏳ En procesamiento"
-            elif task.state == 'SUCCESS':
-                status = 'completed'
-                status_display = "✅ Completado"
-            elif task.state == 'FAILURE':
-                status = 'failed'
-                status_display = "❌ Error"
+            if task.state == "STARTED":
+                status_display = "En procesamiento"
+            elif task.state == "SUCCESS":
+                status_display = "Completado"
+            elif task.state == "FAILURE":
+                status_display = "Error"
             else:
-                status_display = "⏸️ En cola"
+                status_display = "En cola"
         else:
-            status_display = "⏸️ En cola"
-        
-        # Calcular progreso
-        if status == 'completed':
-            progress = 100
-            progress_bar = "████████████████████ 100%"
-        elif status == 'processing':
-            progress = 50
-            progress_bar = "██████████░░░░░░░░░░ 50%"
-        else:
-            progress = 0
-            progress_bar = "░░░░░░░░░░░░░░░░░░░░ 0%"
-        
-        size_mb = round(data['size'] / (1024 * 1024), 2)
-        
+            if status == "completed":
+                status_display = "Completado"
+            elif status == "processing":
+                status_display = "En procesamiento"
+            elif status == "failed":
+                status_display = "Error"
+            else:
+                status_display = "En cola"
+
+        progress = 100 if status_display == "Completado" else 50 if status_display == "En procesamiento" else 0
+        size_mb = round(float(data.get("size", 0)) / (1024 * 1024), 2)
+
         pdfs_info.append({
             "numero": len(pdfs_info) + 1,
-            "nombre_archivo": data['filename'],
+            "nombre_archivo": data.get("filename", f"{pdf_id}.pdf"),
             "tamaño_mb": size_mb,
             "estado": status_display,
             "progreso": f"{progress}%",
-            "barra_progreso": progress_bar,
-            "paginas": task_status_info.get('pages') or "Procesando...",
-            "fecha_subida": task_status_info.get('created_at'),
-            "fecha_completado": task_status_info.get('completed_at') or "Pendiente",
+            "paginas": ts.get("pages") or "Procesando...",
+            "fecha_subida": ts.get("created_at"),
+            "fecha_completado": ts.get("completed_at") or "Pendiente",
             "id_interno": pdf_id,
-            "ruta_texto": task_status_info.get('extracted_text_path') or "No disponible",
-            "ocr_usado": "Sí" if task_status_info.get('used_ocr') else "No",
-            "error": task_status_info.get('error') or "Ninguno"
+            "ruta_texto": ts.get("extracted_text_path") or data.get("text_path") or "No disponible",
+            "ocr_usado": "Sí" if ts.get("used_ocr") else "No",
+            "error": ts.get("error") or "Ninguno",
         })
-    
-    # Contar estados
+
     estados = {
-        "completados": len([p for p in pdfs_info if "✅" in p['estado']]),
-        "procesando": len([p for p in pdfs_info if "⏳" in p['estado']]),
-        "en_cola": len([p for p in pdfs_info if "⏸️" in p['estado']]),
-        "con_error": len([p for p in pdfs_info if "❌" in p['estado']])
+        "completados": len([p for p in pdfs_info if p["estado"] == "Completado"]),
+        "procesando": len([p for p in pdfs_info if p["estado"] == "En procesamiento"]),
+        "en_cola": len([p for p in pdfs_info if p["estado"] == "En cola"]),
+        "con_error": len([p for p in pdfs_info if p["estado"] == "Error"]),
     }
-    
+
     return {
-        "titulo": "📊 Dashboard de Procesamiento de PDFs",
+        "titulo": "Dashboard de Procesamiento de PDFs",
         "total_pdfs": len(pdf_storage),
         "estados": estados,
         "pdfs": pdfs_info,
-        "endpoints_ultiles": {
+        "endpoints_utiles": {
             "consultar_estado": "/api/pdf/upload-status/{pdf_id}",
-            "buscar_en_pdf": "/api/pdf/search/{pdf_id}",
+            "buscar_en_pdf": "/api/pdf/{pdf_id}/search",
             "descargar_texto": "/api/pdf/{pdf_id}/text",
-            "lista_detallada": "/api/pdf/list"
-        }
+            "lista_detallada": "/api/pdf/list",
+        },
     }
 
 @router.delete("/{pdf_id}")
 async def delete_pdf(pdf_id: str):
     if pdf_id not in pdf_storage:
         raise HTTPException(status_code=404, detail="PDF no encontrado")
-    
+
     pdf_data = pdf_storage[pdf_id]
-    
+
     try:
-        # Borrar rutas conocidas de forma segura usando .get() para evitar KeyError
         for key in ("pdf_path", "text_path", "ocr_pdf_path"):
             path = pdf_data.get(key)
-            if path and os.path.exists(path):
+            if path and os.path.exists(str(path)):
                 try:
-                    os.remove(path)
+                    os.remove(str(path))
                 except Exception:
                     logger.exception(f"No se pudo eliminar el archivo {path} para {pdf_id}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error eliminando archivos: {str(e)}")
-    # Eliminar del almacenamiento en memoria y estado de tareas si existe
+
     pdf_storage.pop(pdf_id, None)
     pdf_task_status.pop(pdf_id, None)
-
     return {"message": f"PDF {pdf_id} eliminado exitosamente"}
 
 @router.post("/quick-search")
@@ -986,35 +1087,36 @@ async def quick_search(
     try:
         start_time = time.time()
         file_bytes = await file.read()
-        
+        if not file_bytes:
+            raise HTTPException(status_code=400, detail="Archivo vacío")
+
+        os.makedirs(settings.UPLOAD_FOLDER, exist_ok=True)
         temp_id = f"temp_{hash(file_bytes) % 1000000}"
         temp_path = os.path.join(settings.UPLOAD_FOLDER, f"{temp_id}.pdf")
-        
+
         with open(temp_path, "wb") as f:
             f.write(file_bytes)
-        
-        text, pages, _ = pdf_service.extract_text_from_pdf(temp_path, use_ocr=use_ocr)
+
+        text, _, _ = pdf_service.extract_text_from_pdf(temp_path, use_ocr=use_ocr)
         results = pdf_service.search_in_text(text, search_term)
-        
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
-        
-        execution_time = time.time() - start_time
-        
-        return SearchResponse(
-            term=search_term,
-            total_matches=len(results),
-            results=results[:50],
-            pdf_id="temp",
-            execution_time=execution_time
-        )
+
+        try:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+        except Exception:
+            pass
+
+        return {
+            "term": search_term,
+            "total_matches": len(results),
+            "results": results[:50],
+            "pdf_id": "temp",
+            "execution_time": time.time() - start_time,
+        }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error en búsqueda rápida: {str(e)}")
-
-
-# ======================
-# NUEVO ENDPOINT: BÚSQUEDA GLOBAL
-# ======================
 
 @router.post("/global-search")
 async def global_search(
@@ -1024,92 +1126,69 @@ async def global_search(
     max_documents: int = Query(100, description="Máximo número de documentos a procesar")
 ):
     """
-    Busca un término en los PDFs que cumplen la nomenclatura (mismo criterio que /list).
+    Busca en PDFs que cumplen nomenclatura.
+    - Usa texto desde extracted_texts (txt o txt.gz).
+    - Incluye base_id de DOCS_ROOT si DOCS_ROOT existe.
     """
     start_time = time.time()
     extracted_dir = Path(settings.EXTRACTED_FOLDER)
 
-    def _load_text_from_path(path: str) -> str:
-        try:
-            if not path:
-                return ""
-            if path.endswith('.gz'):
-                import gzip
-                with gzip.open(path, 'rt', encoding='utf-8') as f:
-                    return f.read()
-            else:
-                with open(path, 'r', encoding='utf-8') as f:
-                    return f.read()
-        except Exception:
-            return ""
+    # asegurar versionados en storage si existe DOCS_ROOT
+    _ensure_docs_root_in_storage()
 
-    # Solo PDFs que cumplen la nomenclatura, igual que /list
     valid_entries = [
         (pdf_id, meta)
         for pdf_id, meta in pdf_storage.items()
         if _name_matches_nomenclature(pdf_id, meta)
-    ]
+    ][:max_documents]
 
     document_results = []
 
-    for pdf_id, meta in valid_entries[:max_documents]:
+    for pdf_id, meta in valid_entries:
         ts = pdf_task_status.get(pdf_id, {})
 
-        # 1. Intentar texto en memoria
-        text = meta.get('text') or ''
+        text_path = ts.get("extracted_text_path") or meta.get("text_path")
+        if not text_path or not os.path.exists(str(text_path)):
+            txt_candidate = extracted_dir / f"{pdf_id}.txt"
+            gz_candidate = extracted_dir / f"{pdf_id}.txt.gz"
+            if txt_candidate.exists():
+                text_path = str(txt_candidate)
+            elif gz_candidate.exists():
+                text_path = str(gz_candidate)
+            else:
+                text_path = None
 
-        # 2. Si no hay en memoria, buscar en disco
-        if not text:
-            text_path = ts.get('extracted_text_path') or meta.get('text_path')
-
-            # Si la ruta no está en estado o el archivo no existe, buscar en extracted_texts/
-            if not text_path or not os.path.exists(str(text_path)):
-                txt_candidate = extracted_dir / f"{pdf_id}.txt"
-                txt_gz_candidate = extracted_dir / f"{pdf_id}.txt.gz"
-                if txt_candidate.exists():
-                    text_path = str(txt_candidate)
-                elif txt_gz_candidate.exists():
-                    text_path = str(txt_gz_candidate)
-                else:
-                    text_path = None
-
-            if text_path:
-                text = _load_text_from_path(text_path)
-
+        text = _load_text_from_file(text_path) if text_path else ""
         if not text:
             continue
 
         matches = pdf_service.search_in_text(
-            text, term,
+            text,
+            term,
             case_sensitive=case_sensitive,
             context_chars=context_chars
         )
 
         if matches:
-            filename = meta.get('filename', f'{pdf_id}.pdf')
-            nombre_carpeta = Path(filename).stem  # Sin extensión, con espacios
+            filename = meta.get("filename", f"{pdf_id}.pdf")
             document_results.append({
                 "pdf_id": pdf_id,
                 "filename": filename,
-                "nombre_carpeta": nombre_carpeta,
+                "nombre_carpeta": Path(filename).stem,
                 "total_matches": len(matches),
                 "results": matches[:20],
-                "score": sum(r['score'] for r in matches),
+                "score": sum(r.get("score", 0) for r in matches),
             })
 
-    # Ordenar por relevancia
-    document_results.sort(key=lambda x: x['score'], reverse=True)
-
-    execution_time = time.time() - start_time
+    document_results.sort(key=lambda x: x["score"], reverse=True)
 
     return {
         "term": term,
         "total_documents_with_matches": len(document_results),
-        "total_matches": sum(doc['total_matches'] for doc in document_results),
-        "execution_time": execution_time,
-        "documents": document_results
+        "total_matches": sum(doc["total_matches"] for doc in document_results),
+        "execution_time": time.time() - start_time,
+        "documents": document_results,
     }
-
 
 @router.get("/{pdf_id}/result")
 async def get_ocr_result(pdf_id: str):
@@ -1124,13 +1203,13 @@ async def get_ocr_result(pdf_id: str):
         return {
             "status": status,
             "message": "PDF aún en procesamiento",
-            "task_id": task_status.get("task_id")
+            "task_id": task_status.get("task_id") or "",
         }
 
     if status == "failed":
         return {
             "status": "failed",
-            "error": task_status.get("error")
+            "error": task_status.get("error"),
         }
 
     return {
@@ -1139,7 +1218,6 @@ async def get_ocr_result(pdf_id: str):
         "used_ocr": task_status.get("used_ocr"),
         "pages": task_status.get("pages"),
         "text_path": task_status.get("extracted_text_path"),
-        "ocr_pdf_path": task_status.get("ocr_pdf_path"),
         "download_pdf": f"/api/pdf/{pdf_id}/searchable-pdf",
-        "download_text": f"/api/pdf/{pdf_id}/text"
+        "download_text": f"/api/pdf/{pdf_id}/text",
     }
