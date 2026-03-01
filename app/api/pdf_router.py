@@ -40,8 +40,10 @@ pdf_service = PDFService()
 # =========================
 
 # Regla de filtro "humana" para /list y /global-search
-nomenclature_re = re.compile(r"\b\d+[ _-]+\d+(?:-[\d]+)*[ _-]+[CP](?=[\s_-]|$)", re.IGNORECASE)
-
+nomenclature_re = re.compile(
+    r"\b\d+(?:[ _-]+\d+)+[ _-]+[CP](?=[\s_-]|$)",
+    re.IGNORECASE
+)
 def _name_matches_nomenclature(pdf_id: str, data: dict = None) -> bool:
     filename = None
     if isinstance(data, dict):
@@ -850,27 +852,27 @@ async def merge_with_output(
 @router.get("/list", response_model=PDFListResponse)
 async def list_pdfs():
     """
-    Devuelve PDFs filtrados por nomenclatura.
-    - created_at/completed_at son datetime (como tu schema).
-    - upload_time es float (como tu schema).
-    - Si existe DOCS_ROOT, agrega base_id con versión latest (sin duplicar versiones).
-    """
-    # cargar flujo normal desde disco (si no se hace en startup)
-    try:
-        load_existing_pdfs()
-    except Exception:
-        logger.exception("No se pudo cargar PDFs existentes desde disco")
+    LISTA SOLO DESDE DOCS_ROOT (versionados).
+    Devuelve 1 entrada por carpeta base_id (la versión más alta: vN, luego ts, luego mtime).
 
+    - created_at/completed_at: datetime o None
+    - upload_time: float (mtime del pdf latest)
+    """
     extracted_dir = Path(settings.EXTRACTED_FOLDER)
     outputs_dir = Path(settings.OUTPUTS_FOLDER)
 
     pdfs_list: list[Dict[str, Any]] = []
 
-    # 1) Versionados (si existe DOCS_ROOT)
+    # 1) SOLO Versionados desde DOCS_ROOT
     docs_root = _get_docs_root_safe()
-    latest_map = _scan_docs_root_latest_versions(docs_root) if docs_root else {}
+    if not docs_root:
+        # si quieres, puedes cambiar esto por regresar lista vacía en vez de error
+        raise HTTPException(status_code=400, detail="DOCS_ROOT no está configurado en settings")
+
+    latest_map = _scan_docs_root_latest_versions(docs_root)
 
     for base_id, info in latest_map.items():
+        # filtro por nomenclatura (mismo criterio que ya usas)
         if not _name_matches_nomenclature(base_id, {"filename": base_id}):
             continue
 
@@ -884,7 +886,6 @@ async def list_pdfs():
         size_bytes = int(info["size"])
         size_mb = round(size_bytes / (1024 * 1024), 2)
 
-        # Para base_id no tenemos "created_at" real del proceso; dejamos None o inferido si existe
         created_at = ts.get("created_at")
         completed_at = ts.get("completed_at")
 
@@ -905,7 +906,7 @@ async def list_pdfs():
             "error": ts.get("error"),
         })
 
-        # sync en storage para que global-search lo vea
+        # sync en storage (opcional, sirve para global-search)
         if base_id not in pdf_storage:
             pdf_storage[base_id] = {
                 "filename": f"{base_id}.pdf",
@@ -915,53 +916,6 @@ async def list_pdfs():
                 "mode": "local",
                 "task_id": None,
             }
-
-    # 2) Flujo normal (pdf_storage)
-    for pdf_id, data in list(pdf_storage.items()):
-        if pdf_id in latest_map:
-            continue
-        if not _name_matches_nomenclature(pdf_id, data):
-            continue
-
-        ts = pdf_task_status.get(pdf_id, {})
-        status = ts.get("status", "unknown")
-        task_id = ts.get("task_id")
-        mode = ts.get("mode") or data.get("mode") or ("celery" if task_id else "local")
-
-        # Celery: refrescar si está pending
-        if mode == "celery" and status == "pending" and task_id:
-            task = celery_app.AsyncResult(task_id)
-            if task.state == "STARTED":
-                status = "processing"
-            elif task.state == "SUCCESS":
-                status = "completed"
-            elif task.state == "FAILURE":
-                status = "failed"
-
-        progress = 100 if status == "completed" else 50 if status == "processing" else 0
-
-        size_bytes = int(data.get("size", 0))
-        size_mb = round(size_bytes / (1024 * 1024), 2)
-
-        created_at = ts.get("created_at")
-        completed_at = ts.get("completed_at")
-
-        pdfs_list.append({
-            "id": pdf_id,
-            "filename": data.get("filename", f"{pdf_id}.pdf"),
-            "size_bytes": size_bytes,
-            "size_mb": size_mb,
-            "status": status if status in ("completed", "processing", "pending", "failed") else "pending",
-            "progress": int(progress),
-            "pages": ts.get("pages"),
-            "task_id": task_id or "",
-            "upload_time": float(data.get("upload_time", time.time())),
-            "created_at": created_at if isinstance(created_at, datetime) else None,
-            "completed_at": completed_at if isinstance(completed_at, datetime) else None,
-            "extracted_text_path": ts.get("extracted_text_path"),
-            "used_ocr": bool(ts.get("used_ocr", False)),
-            "error": ts.get("error"),
-        })
 
     # Ordenar por upload_time desc
     pdfs_list.sort(key=lambda x: x.get("upload_time", 0), reverse=True)
