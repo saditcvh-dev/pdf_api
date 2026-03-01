@@ -11,6 +11,7 @@ class Settings:
     API_PORT = int(os.getenv("API_PORT", 8000))
     UPLOAD_FOLDER = os.getenv("UPLOAD_FOLDER", "uploads")
     EXTRACTED_FOLDER = os.getenv("EXTRACTED_FOLDER", "extracted_texts")
+    DOCS_ROOT = os.getenv("DOCS_ROOT", "docs")  # Nueva carpeta para PDFs y Textos finales
     # --- MODIFICADO POR NICO ---
     # Nueva carpeta centralizada para los PDFs y Textos finales
     OUTPUTS_FOLDER = os.getenv("OUTPUTS_FOLDER", "outputs")
@@ -40,6 +41,7 @@ class Settings:
         os.makedirs(cls.EXTRACTED_FOLDER, exist_ok=True)
         # --- MODIFICADO POR NICO ---
         os.makedirs(cls.OUTPUTS_FOLDER, exist_ok=True)
+        os.makedirs(cls.DOCS_ROOT, exist_ok=True)
         # ---------------------------
     def __init__(self):
         # Establecer TESSDATA_PREFIX si no está configurado
