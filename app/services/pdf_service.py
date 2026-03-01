@@ -213,7 +213,9 @@ class PDFService:
         return (term_count * 10) + (100 / max(1, context_len / 100))
 
     def save_extracted_text(self, text: str, pdf_id: str) -> str:
-        filename = f"{pdf_id}.txt"
+        # Extraer el nombre base sin el hash (ej: 7365_04_11_07_001_C_a1b2c3d4e5f6 -> 7365_04_11_07_001_C)
+        base_name = pdf_id[:-17] if len(pdf_id) > 17 else pdf_id
+        filename = f"{base_name}.txt"
         filepath = Path(settings.EXTRACTED_FOLDER) / filename
         filepath.parent.mkdir(parents=True, exist_ok=True)
 
