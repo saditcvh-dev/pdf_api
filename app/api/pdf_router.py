@@ -855,6 +855,8 @@ async def list_pdfs():
         'processing': [p for p in pdfs_list if p['status'] == 'processing'],
         'pending': [p for p in pdfs_list if p['status'] == 'pending'],
         'failed': [p for p in pdfs_list if p['status'] == 'failed'],
+        'unknown': [p for p in pdfs_list if p['status'] == 'unknown'],
+        'with_ocr': [p for p in pdfs_list if p.get('used_ocr', False)],
     }
     
     return {
@@ -863,14 +865,18 @@ async def list_pdfs():
             "completed": len(by_status['completed']),
             "processing": len(by_status['processing']),
             "pending": len(by_status['pending']),
-            "failed": len(by_status['failed'])
+            "failed": len(by_status['failed']),
+            "unknown": len(by_status['unknown']),
+            "with_ocr": len(by_status['with_ocr'])
         },
         "pdfs": pdfs_list,
         "summary": {
             "completed": by_status['completed'],
             "processing": by_status['processing'],
             "pending": by_status['pending'],
-            "failed": by_status['failed']
+            "failed": by_status['failed'],
+            "unknown": by_status['unknown'],
+            "with_ocr": by_status['with_ocr']
         }
     }
 @router.get("/dashboard")
