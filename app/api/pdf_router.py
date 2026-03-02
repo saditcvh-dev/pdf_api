@@ -760,6 +760,41 @@ async def get_searchable_pdf(pdf_id: str):
     if not task_status:
         raise HTTPException(status_code=404, detail="ID de PDF no reconocido")
 
+    # refrescar Celery si aplica antes de evaluar
+    task_id = task_status.get("task_id")
+    mode = task_status.get("mode", "local")
+    if mode == "celery" and task_id:
+        try:
+            task = celery_app.AsyncResult(task_id)
+            if task.state == "SUCCESS" and isinstance(task.result, dict):
+                result = task.result
+                pdf_task_status[pdf_id].update({
+                    "status": "completed",
+                    "pages": result.get("pages"),
+                    "extracted_text_path": result.get("text_path"),
+                    "ocr_pdf_path": result.get("pdf_path"),
+                    "used_ocr": result.get("used_ocr"),
+                    "text_length": result.get("text_length"),
+                    "completed_at": datetime.now(),
+                    "error": None,
+                    "progress": 100,
+                })
+                if pdf_id in pdf_storage:
+                    pdf_storage[pdf_id].update({
+                        "pages": result.get("pages"),
+                        "text_path": result.get("text_path"),
+                        "completed": True,
+                    })
+            elif task.state == "FAILURE":
+                pdf_task_status[pdf_id].update({
+                    "status": "failed",
+                    "error": str(task.info) if task.info else "Error desconocido",
+                    "completed_at": datetime.now(),
+                    "progress": 0,
+                })
+        except Exception:
+            pass
+
     current_status = task_status.get("status", "unknown")
     if current_status in ("pending", "processing"):
         return JSONResponse(
@@ -767,7 +802,7 @@ async def get_searchable_pdf(pdf_id: str):
             content={
                 "status": current_status,
                 "message": "El PDF aún se está procesando",
-                "task_id": task_status.get("task_id") or "",
+                "task_id": task_id or "",
                 "progress": int(task_status.get("progress") or 0),
             }
         )
@@ -929,6 +964,48 @@ async def list_pdfs():
 
     latest_map = _scan_docs_root_latest_versions(docs_root)
 
+    # === FUNCION INTERNA PARA ACTUALIZAR ESTADO CELERY ===
+    def _refresh_celery_status(p_id: str, ts_dict: dict, meta_dict: dict = None):
+        meta_dict = meta_dict or {}
+        task_id = ts_dict.get("task_id") or meta_dict.get("task_id")
+        mode = ts_dict.get("mode") or meta_dict.get("mode") or ("celery" if task_id else "local")
+        
+        if mode == "celery" and task_id:
+            try:
+                task = celery_app.AsyncResult(task_id)
+                if task.state == "SUCCESS" and isinstance(task.result, dict):
+                    res = task.result
+                    # Solo actualizar si antes NO era completed
+                    if ts_dict.get("status") != "completed":
+                        ts_dict.update({
+                            "status": "completed",
+                            "pages": res.get("pages"),
+                            "extracted_text_path": res.get("text_path"),
+                            "ocr_pdf_path": res.get("pdf_path"),
+                            "used_ocr": res.get("used_ocr"),
+                            "text_length": res.get("text_length"),
+                            "completed_at": datetime.now(),
+                            "error": None,
+                            "progress": 100,
+                        })
+                        if p_id in pdf_storage:
+                            pdf_storage[p_id].update({
+                                "pages": res.get("pages"),
+                                "text_path": res.get("text_path"),
+                                "completed": True,
+                            })
+                elif task.state == "FAILURE":
+                    if ts_dict.get("status") != "failed":
+                        ts_dict.update({
+                            "status": "failed",
+                            "error": str(task.info) if task.info else "Error desconocido",
+                            "completed_at": datetime.now(),
+                            "progress": 0,
+                        })
+            except Exception:
+                pass
+
+
     for base_id, info in latest_map.items():
         if not _name_matches_nomenclature(base_id, {"filename": base_id}):
             continue
@@ -936,9 +1013,11 @@ async def list_pdfs():
         ts = pdf_task_status.get(base_id)
         if not ts:
             ts = _infer_status_for_base(base_id, extracted_dir, outputs_dir)
+            
+        _refresh_celery_status(base_id, ts)
 
         status = ts.get("status", "unknown")
-        progress = 100 if status == "completed" else 50 if status == "processing" else 0
+        progress = int(ts.get("progress") or (100 if status == "completed" else 50 if status == "processing" else 0))
 
         size_bytes = int(info["size"])
         size_mb = round(size_bytes / (1024 * 1024), 2)
@@ -986,8 +1065,10 @@ async def list_pdfs():
             continue
 
         ts = pdf_task_status.get(pdf_id, {})
+        _refresh_celery_status(pdf_id, ts, meta)
+        
         status = ts.get("status") or meta.get("status") or "unknown"
-        progress = 100 if status == "completed" else 50 if status == "processing" else 0
+        progress = int(ts.get("progress") or (100 if status == "completed" else 50 if status == "processing" else 0))
         
         size_bytes = int(meta.get("size", 0))
         size_mb = round(size_bytes / (1024 * 1024), 2)
