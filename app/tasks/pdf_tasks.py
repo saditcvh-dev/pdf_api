@@ -131,14 +131,45 @@ def process_pdf_task(self, pdf_id: str, pdf_path: str, use_ocr: bool = True):
             'status': 'completed'
         }
 
-        # Opcional: marcar éxito explícitamente
+
+        # Opcional: marcar éxito explícitamente en Celery
         self.update_state(
             state="SUCCESS",
             meta=result_dict
         )
 
+        from app.core.state import pdf_task_status, pdf_storage
+        from datetime import datetime
+        
+        pdf_task_status.update_key(pdf_id, {
+            "status": "completed",
+            "pages": pages,
+            "extracted_text_path": text_path,
+            "ocr_pdf_path": final_pdf_path,
+            "used_ocr": used_ocr,
+            "text_length": len(text),
+            "completed_at": datetime.now(),
+            "error": None,
+            "progress": 100
+        })
+        
+        if pdf_id in pdf_storage:
+            pdf_storage.update_key(pdf_id, {
+                "pages": pages,
+                "text_path": text_path,
+                "completed": True
+            })
+
         return result_dict
 
     except Exception as e:
         logger.exception(f"[ERROR] Fallo en procesamiento de {pdf_id}")
+        from app.core.state import pdf_task_status
+        from datetime import datetime
+        pdf_task_status.update_key(pdf_id, {
+            "status": "failed",
+            "error": str(e),
+            "completed_at": datetime.now(),
+            "progress": 0
+        })
         raise
