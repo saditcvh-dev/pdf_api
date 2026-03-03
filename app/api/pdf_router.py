@@ -1,5 +1,6 @@
 from fastapi import APIRouter, UploadFile, File, HTTPException, Query
 from fastapi.responses import FileResponse, JSONResponse
+from pydantic import BaseModel
 import os
 import time
 from datetime import datetime
@@ -256,6 +257,9 @@ def load_existing_pdfs() -> None:
             except Exception as e:
                 logger.exception(f"Error cargando PDF {pdf_file}: {e}")
 
+    # Asegurar que también se cargan los PDFs versionados que ya están en DOCS_ROOT
+    _ensure_docs_root_in_storage()
+
 def _infer_status_for_base(base_id: str, extracted_dir: Path, outputs_dir: Path) -> dict:
     """
     Versionados: base_id (underscores) NO debe buscar {base_id}.txt.
@@ -341,6 +345,9 @@ def _ensure_docs_root_in_storage() -> None:
     if not docs_root:
         return
     latest_map = _scan_docs_root_latest_versions(docs_root)
+    extracted_dir = Path(settings.EXTRACTED_FOLDER)
+    outputs_dir = Path(settings.OUTPUTS_FOLDER)
+
     for base_id, info in latest_map.items():
         if base_id not in pdf_storage:
             pdf_storage[base_id] = {
@@ -351,6 +358,11 @@ def _ensure_docs_root_in_storage() -> None:
                 "mode": "local",
                 "task_id": None,
             }
+
+        if base_id not in pdf_task_status:
+            ts = _infer_status_for_base(base_id, extracted_dir, outputs_dir)
+            ts["created_at"] = datetime.fromtimestamp(info["mtime"])
+            pdf_task_status[base_id] = ts
 
 # =========================
 # Endpoints
@@ -726,16 +738,12 @@ async def get_pdf_text(pdf_id: str):
 @router.get("/{pdf_id}/searchable-pdf")
 async def get_searchable_pdf(pdf_id: str):
     outputs_dir = Path(settings.OUTPUTS_FOLDER)
-    docs_root = _get_docs_root_safe()
 
-    # Caso A: base_id (versionado) -> devuelve PDF latest en DOCS_ROOT
+    # Caso A: base_id (versionado) -> devuelve PDF latest en DOCS_ROOT que tenemos en caché
     if _is_base_id(pdf_id):
-        if not docs_root:
-            raise HTTPException(status_code=400, detail="DOCS_ROOT no está configurado en settings")
-        latest_map = _scan_docs_root_latest_versions(docs_root)
-        info = latest_map.get(pdf_id)
-        if not info:
-            raise HTTPException(status_code=404, detail="No se encontró ninguna versión para ese base_id")
+        info = pdf_storage.get(pdf_id)
+        if not info or "pdf_path" not in info:
+            raise HTTPException(status_code=404, detail="No se encontró ninguna versión para ese base_id en caché")
 
         pdf_path = info["pdf_path"]
         if not os.path.exists(pdf_path):
@@ -950,19 +958,10 @@ async def merge_with_output(
 @router.get("/list", response_model=PDFListResponse)
 async def list_pdfs():
     """
-    LISTA SOLO DESDE DOCS_ROOT (versionados).
-    Devuelve 1 entrada por carpeta base_id (la versión más alta: vN, luego ts, luego mtime).
+    LISTA DESDE CACHÉ EN MEMORIA.
+    Ya no escanea DOCS_ROOT en cada llamada, depende de pdf_storage cargado al inicio.
     """
-    extracted_dir = Path(settings.EXTRACTED_FOLDER)
-    outputs_dir = Path(settings.OUTPUTS_FOLDER)
-
     pdfs_list: list[Dict[str, Any]] = []
-
-    docs_root = _get_docs_root_safe()
-    if not docs_root:
-        raise HTTPException(status_code=400, detail="DOCS_ROOT no está configurado en settings")
-
-    latest_map = _scan_docs_root_latest_versions(docs_root)
 
     # === FUNCION INTERNA PARA ACTUALIZAR ESTADO CELERY ===
     def _refresh_celery_status(p_id: str, ts_dict: dict, meta_dict: dict = None):
@@ -1097,19 +1096,11 @@ async def list_pdfs():
     # === AÑADIR PDFs SUBIDOS (No versionados en DOCS_ROOT) ===
     # Estos PDFs están en pdf_storage pero no en latest_map
     for pdf_id, meta in pdf_storage.items():
-        if pdf_id in latest_map:
-            continue  # Ya procesado arriba
-
-        # Evitar duplicados si el pdf_id original corresponde a un archivo que ya leímos de DOCS_ROOT
-        original_filename = meta.get("filename", "")
-        if original_filename:
-            norm_name = re.sub(r'[^\w]', '_', Path(original_filename).stem)
-            norm_name = re.sub(r'_+', '_', norm_name).strip('_').upper()
-            if norm_name in processed_base_ids:
-                continue
-
         # Ocultar temporales de quick-search
         if pdf_id.startswith("temp_"):
+            continue
+
+        if not _name_matches_nomenclature(pdf_id, meta):
             continue
 
         ts = pdf_task_status.get(pdf_id, {})
@@ -1316,8 +1307,6 @@ async def global_search(
     start_time = time.time()
     extracted_dir = Path(settings.EXTRACTED_FOLDER)
 
-    _ensure_docs_root_in_storage()
-
     valid_entries = [
         (pdf_id, meta)
         for pdf_id, meta in pdf_storage.items()
@@ -1408,3 +1397,48 @@ async def get_ocr_result(pdf_id: str):
         "download_pdf": f"/api/pdf/{pdf_id}/searchable-pdf",
         "download_text": f"/api/pdf/{pdf_id}/text",
     }
+
+from pydantic import BaseModel
+
+class UpdatePathRequest(BaseModel):
+    new_path: str
+
+@router.put("/update-final-path/{pdf_id}")
+async def update_final_path(pdf_id: str, request: UpdatePathRequest):
+    """
+    Actualiza la ruta final del documento en memoria de manera que Python 
+    no necesite reescudriñar el directorio DOCS_ROOT. (Llamado usualmente por Node.js)
+    """
+    if pdf_id not in pdf_storage and pdf_id not in pdf_task_status:
+        # Si no existe, podemos crearlo o simplemente informar que falló
+        # Asumimos que si no existe en storage es porque se está subiendo por otra vía.
+        pdf_storage[pdf_id] = {
+            "filename": f"{pdf_id}.pdf",
+            "pdf_path": request.new_path,
+            "size": 0,
+            "upload_time": time.time(),
+            "mode": "local",
+            "task_id": None,
+        }
+    else:
+        if pdf_id in pdf_storage:
+            pdf_storage[pdf_id]["pdf_path"] = request.new_path
+    
+    # Asegurarnos de que el pdf_task_status lo reconozca también para listarlo ok
+    if pdf_id not in pdf_task_status:
+        pdf_task_status[pdf_id] = {
+            "status": "completed",
+            "created_at": datetime.now(),
+            "completed_at": datetime.now(),
+            "used_ocr": False,
+            "extracted_text_path": None,
+            "ocr_pdf_path": request.new_path,
+            "task_id": None,
+            "mode": "local",
+            "pages": None,
+            "error": None,
+        }
+    else:
+        pdf_task_status[pdf_id]["ocr_pdf_path"] = request.new_path
+        
+    return {"message": "Ruta actualizada exitosamente en memoria", "pdf_id": pdf_id, "new_path": request.new_path}
