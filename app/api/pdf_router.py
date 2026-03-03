@@ -179,6 +179,9 @@ def load_existing_pdfs() -> None:
     - Rellena pdf_storage y pdf_task_status.
     - created_at/completed_at se guardan como datetime (porque tu schema así lo pide).
     """
+    # Ensure DOCS_ROOT is loaded first so it overrides historical leftovers
+    _ensure_docs_root_in_storage()
+
     uploads_dir = Path(settings.UPLOAD_FOLDER)
     extracted_dir = Path(settings.EXTRACTED_FOLDER)
     outputs_dir = Path(settings.OUTPUTS_FOLDER)
@@ -202,6 +205,13 @@ def load_existing_pdfs() -> None:
                 if not pdf_id or pdf_id.startswith("."):
                     continue
                 if pdf_id in pdf_storage:
+                    continue
+
+                safe_name_part = pdf_id[:-17] if len(pdf_id) > 17 else pdf_id
+                normalized_base = safe_name_part.replace("-", "_")
+                
+                if normalized_base in pdf_storage:
+                    logger.debug(f"Ignorando leftover de subida {pdf_id} porque la final {normalized_base} ya está en memoria.")
                     continue
 
                 mtime = float(pdf_file.stat().st_mtime)
@@ -257,8 +267,7 @@ def load_existing_pdfs() -> None:
             except Exception as e:
                 logger.exception(f"Error cargando PDF {pdf_file}: {e}")
 
-    # Asegurar que también se cargan los PDFs versionados que ya están en DOCS_ROOT
-    _ensure_docs_root_in_storage()
+    # Fin de load_existing_pdfs. Memoria global lista.
 
 def _infer_status_for_base(base_id: str, extracted_dir: Path, outputs_dir: Path) -> dict:
     """
