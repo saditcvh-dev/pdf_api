@@ -985,7 +985,7 @@ async def list_pdfs():
                     res = task.result
                     # Solo actualizar si antes NO era completed
                     if ts_dict.get("status") != "completed":
-                        updates = {
+                        ts_dict.update({
                             "status": "completed",
                             "pages": res.get("pages"),
                             "extracted_text_path": res.get("text_path"),
@@ -995,115 +995,25 @@ async def list_pdfs():
                             "completed_at": datetime.now(),
                             "error": None,
                             "progress": 100,
-                        }
-                        ts_dict.update(updates)
-                        pdf_task_status.update_key(p_id, updates)
-
+                        })
                         if p_id in pdf_storage:
-                            pdf_storage.update_key(p_id, {
+                            pdf_storage[p_id].update({
                                 "pages": res.get("pages"),
                                 "text_path": res.get("text_path"),
                                 "completed": True,
                             })
                 elif task.state == "FAILURE":
                     if ts_dict.get("status") != "failed":
-                        updates = {
+                        ts_dict.update({
                             "status": "failed",
                             "error": str(task.info) if task.info else "Error desconocido",
                             "completed_at": datetime.now(),
                             "progress": 0,
-                        }
-                        ts_dict.update(updates)
-                        pdf_task_status.update_key(p_id, updates)
+                        })
             except Exception:
                 pass
 
-    # === CREAR MAPA INVERSO PARA IDs ACTIVOS ===
-    active_uploads = {}
-    for pdf_id, meta in pdf_storage.items():
-        original_filename = meta.get("filename", "")
-        if original_filename:
-            norm_name = re.sub(r'[^\w]', '_', Path(original_filename).stem)
-            norm_name = re.sub(r'_+', '_', norm_name).strip('_').upper()
-            active_uploads[norm_name] = pdf_id
 
-    for base_id, info in latest_map.items():
-        if not _name_matches_nomenclature(base_id, {"filename": base_id}):
-            continue
-
-        active_pdf_id = active_uploads.get(base_id.upper())
-        if active_pdf_id:
-            # USAR EL ESTADO DEL UPLOAD ACTIVO EN VEZ DEL HISTORICO
-            ts = pdf_task_status.get(active_pdf_id, {})
-            meta = pdf_storage.get(active_pdf_id, {})
-            _refresh_celery_status(active_pdf_id, ts, meta)
-            
-            status = ts.get("status") or meta.get("status") or "unknown"
-            progress = int(ts.get("progress") or (100 if status == "completed" else 50 if status == "processing" else 0))
-            task_id_active = ts.get("task_id") or meta.get("task_id") or ""
-            pages = ts.get("pages") or meta.get("pages")
-            
-            created_at = ts.get("created_at")
-            completed_at = ts.get("completed_at")
-            extracted_text_path = ts.get("extracted_text_path") or meta.get("text_path")
-            used_ocr = bool(ts.get("used_ocr") or meta.get("use_ocr", False))
-            error_msg = ts.get("error") or meta.get("error")
-            upload_time_val = float(meta.get("upload_time", info["mtime"]))
-        else:
-            # FLUJO NORMAL USANDO DOCS_ROOT histórico
-            ts = pdf_task_status.get(base_id)
-            if not ts:
-                ts = _infer_status_for_base(base_id, extracted_dir, outputs_dir)
-                
-            _refresh_celery_status(base_id, ts)
-
-            status = ts.get("status", "unknown")
-            progress = int(ts.get("progress") or (100 if status == "completed" else 50 if status == "processing" else 0))
-            task_id_active = ts.get("task_id") or ""
-            pages = ts.get("pages")
-            
-            created_at = ts.get("created_at")
-            completed_at = ts.get("completed_at")
-            extracted_text_path = ts.get("extracted_text_path")
-            used_ocr = bool(ts.get("used_ocr", False))
-            error_msg = ts.get("error")
-            upload_time_val = float(info["mtime"])
-
-        size_bytes = int(info["size"])
-        size_mb = round(size_bytes / (1024 * 1024), 2)
-
-        pdfs_list.append({
-            "id": base_id,
-            "filename": f"{base_id}.pdf",
-            "size_bytes": size_bytes,
-            "size_mb": size_mb,
-            "status": status if status in ("completed", "processing", "pending", "failed") else "unknown",
-            "progress": progress,
-            "pages": pages,
-            "task_id": task_id_active,
-            "upload_time": upload_time_val,
-            "created_at": created_at if isinstance(created_at, datetime) else None,
-            "completed_at": completed_at if isinstance(completed_at, datetime) else None,
-            "extracted_text_path": extracted_text_path,
-            "used_ocr": used_ocr,
-            "error": error_msg,
-        })
-    
-        # sync en storage (opcional, sirve para global-search)
-        if base_id not in pdf_storage:
-            pdf_storage[base_id] = {
-                "filename": f"{base_id}.pdf",
-                "pdf_path": info["pdf_path"],
-                "size": size_bytes,
-                "upload_time": float(info["mtime"]),
-                "mode": "local",
-                "task_id": None,
-            }
-
-    processed_base_ids = {str(k).upper() for k in latest_map.keys()}
-
-    # === AÑADIR PDFs SUBIDOS (No versionados en DOCS_ROOT) ===
-    # Estos PDFs están en pdf_storage pero no en latest_map
     for pdf_id, meta in pdf_storage.items():
         # Ocultar temporales de quick-search
         if pdf_id.startswith("temp_"):
@@ -1167,7 +1077,6 @@ async def list_pdfs():
         "pdfs": pdfs_list,
         "summary": by_status_lists
     }
-
 @router.get("/dashboard")
 async def get_dashboard():
     """
