@@ -412,7 +412,7 @@ async def upload_pdf(file: UploadFile = File(...), use_ocr: bool = Query(True)):
         if has_workers:
             task = process_pdf_task.delay(pdf_id=pdf_id, pdf_path=pdf_path, use_ocr=use_ocr)
 
-            pdf_storage[pdf_id].update({"task_id": task.id, "mode": "celery"})
+            pdf_storage.update_key(pdf_id, {"task_id": task.id, "mode": "celery"})
             pdf_task_status[pdf_id] = {
                 "task_id": task.id,
                 "status": "pending",
@@ -439,7 +439,7 @@ async def upload_pdf(file: UploadFile = File(...), use_ocr: bool = Query(True)):
             )
 
         # Local
-        pdf_storage[pdf_id].update({"task_id": None, "mode": "local"})
+        pdf_storage.update_key(pdf_id, {"task_id": None, "mode": "local"})
         pdf_task_status[pdf_id] = {
             "task_id": None,
             "status": "pending",
@@ -456,13 +456,13 @@ async def upload_pdf(file: UploadFile = File(...), use_ocr: bool = Query(True)):
 
         def _local_process(pid: str, ppath: str, puse_ocr: bool):
             try:
-                pdf_task_status[pid].update({"status": "processing", "progress": 50})
+                pdf_task_status.update_key(pid, {"status": "processing", "progress": 50})
                 text, pages, used_ocr_ = pdf_service.extract_text_from_pdf(ppath, use_ocr=puse_ocr)
 
                 # Flujo normal: pid trae hash, el txt de este flujo sigue guardándose con pid
                 text_path = pdf_service.save_extracted_text(text, pid)
 
-                pdf_task_status[pid].update({
+                pdf_task_status.update_key(pid, {
                     "status": "completed",
                     "pages": pages,
                     "extracted_text_path": text_path,
@@ -473,13 +473,13 @@ async def upload_pdf(file: UploadFile = File(...), use_ocr: bool = Query(True)):
                 })
 
                 # NO guardar texto completo
-                pdf_storage[pid].update({
+                pdf_storage.update_key(pid, {
                     "pages": pages,
                     "text_path": text_path,
                 })
             except Exception as e:
                 logger.exception(f"Error en procesamiento local {pid}: {e}")
-                pdf_task_status[pid].update({
+                pdf_task_status.update_key(pid, {
                     "status": "failed",
                     "error": str(e),
                     "completed_at": datetime.now(),
@@ -544,7 +544,7 @@ async def get_upload_status(pdf_id: str):
 
     if task.state == "SUCCESS" and isinstance(task.result, dict):
         result = task.result
-        pdf_task_status[pdf_id].update({
+        pdf_task_status.update_key(pdf_id, {
             "status": "completed",
             "pages": result.get("pages"),
             "extracted_text_path": result.get("text_path"),
@@ -556,7 +556,7 @@ async def get_upload_status(pdf_id: str):
             "mode": "celery",
             "progress": 100,
         })
-        pdf_storage.get(pdf_id, {}).update({
+        pdf_storage.update_key(pdf_id, {
             "pages": result.get("pages"),
             "text_path": result.get("text_path"),
             "completed": True,
@@ -564,7 +564,7 @@ async def get_upload_status(pdf_id: str):
 
     elif task.state == "FAILURE":
         err = str(task.info) if task.info else "Error desconocido"
-        pdf_task_status[pdf_id].update({
+        pdf_task_status.update_key(pdf_id, {
             "status": "failed",
             "error": err,
             "completed_at": datetime.now(),
@@ -976,7 +976,7 @@ async def list_pdfs():
                     res = task.result
                     # Solo actualizar si antes NO era completed
                     if ts_dict.get("status") != "completed":
-                        ts_dict.update({
+                        updates = {
                             "status": "completed",
                             "pages": res.get("pages"),
                             "extracted_text_path": res.get("text_path"),
@@ -986,25 +986,115 @@ async def list_pdfs():
                             "completed_at": datetime.now(),
                             "error": None,
                             "progress": 100,
-                        })
+                        }
+                        ts_dict.update(updates)
+                        pdf_task_status.update_key(p_id, updates)
+
                         if p_id in pdf_storage:
-                            pdf_storage[p_id].update({
+                            pdf_storage.update_key(p_id, {
                                 "pages": res.get("pages"),
                                 "text_path": res.get("text_path"),
                                 "completed": True,
                             })
                 elif task.state == "FAILURE":
                     if ts_dict.get("status") != "failed":
-                        ts_dict.update({
+                        updates = {
                             "status": "failed",
                             "error": str(task.info) if task.info else "Error desconocido",
                             "completed_at": datetime.now(),
                             "progress": 0,
-                        })
+                        }
+                        ts_dict.update(updates)
+                        pdf_task_status.update_key(p_id, updates)
             except Exception:
                 pass
 
+    # === CREAR MAPA INVERSO PARA IDs ACTIVOS ===
+    active_uploads = {}
+    for pdf_id, meta in pdf_storage.items():
+        original_filename = meta.get("filename", "")
+        if original_filename:
+            norm_name = re.sub(r'[^\w]', '_', Path(original_filename).stem)
+            norm_name = re.sub(r'_+', '_', norm_name).strip('_').upper()
+            active_uploads[norm_name] = pdf_id
 
+    for base_id, info in latest_map.items():
+        if not _name_matches_nomenclature(base_id, {"filename": base_id}):
+            continue
+
+        active_pdf_id = active_uploads.get(base_id.upper())
+        if active_pdf_id:
+            # USAR EL ESTADO DEL UPLOAD ACTIVO EN VEZ DEL HISTORICO
+            ts = pdf_task_status.get(active_pdf_id, {})
+            meta = pdf_storage.get(active_pdf_id, {})
+            _refresh_celery_status(active_pdf_id, ts, meta)
+            
+            status = ts.get("status") or meta.get("status") or "unknown"
+            progress = int(ts.get("progress") or (100 if status == "completed" else 50 if status == "processing" else 0))
+            task_id_active = ts.get("task_id") or meta.get("task_id") or ""
+            pages = ts.get("pages") or meta.get("pages")
+            
+            created_at = ts.get("created_at")
+            completed_at = ts.get("completed_at")
+            extracted_text_path = ts.get("extracted_text_path") or meta.get("text_path")
+            used_ocr = bool(ts.get("used_ocr") or meta.get("use_ocr", False))
+            error_msg = ts.get("error") or meta.get("error")
+            upload_time_val = float(meta.get("upload_time", info["mtime"]))
+        else:
+            # FLUJO NORMAL USANDO DOCS_ROOT histórico
+            ts = pdf_task_status.get(base_id)
+            if not ts:
+                ts = _infer_status_for_base(base_id, extracted_dir, outputs_dir)
+                
+            _refresh_celery_status(base_id, ts)
+
+            status = ts.get("status", "unknown")
+            progress = int(ts.get("progress") or (100 if status == "completed" else 50 if status == "processing" else 0))
+            task_id_active = ts.get("task_id") or ""
+            pages = ts.get("pages")
+            
+            created_at = ts.get("created_at")
+            completed_at = ts.get("completed_at")
+            extracted_text_path = ts.get("extracted_text_path")
+            used_ocr = bool(ts.get("used_ocr", False))
+            error_msg = ts.get("error")
+            upload_time_val = float(info["mtime"])
+
+        size_bytes = int(info["size"])
+        size_mb = round(size_bytes / (1024 * 1024), 2)
+
+        pdfs_list.append({
+            "id": base_id,
+            "filename": f"{base_id}.pdf",
+            "size_bytes": size_bytes,
+            "size_mb": size_mb,
+            "status": status if status in ("completed", "processing", "pending", "failed") else "unknown",
+            "progress": progress,
+            "pages": pages,
+            "task_id": task_id_active,
+            "upload_time": upload_time_val,
+            "created_at": created_at if isinstance(created_at, datetime) else None,
+            "completed_at": completed_at if isinstance(completed_at, datetime) else None,
+            "extracted_text_path": extracted_text_path,
+            "used_ocr": used_ocr,
+            "error": error_msg,
+        })
+    
+        # sync en storage (opcional, sirve para global-search)
+        if base_id not in pdf_storage:
+            pdf_storage[base_id] = {
+                "filename": f"{base_id}.pdf",
+                "pdf_path": info["pdf_path"],
+                "size": size_bytes,
+                "upload_time": float(info["mtime"]),
+                "mode": "local",
+                "task_id": None,
+            }
+
+    processed_base_ids = {str(k).upper() for k in latest_map.keys()}
+
+    # === AÑADIR PDFs SUBIDOS (No versionados en DOCS_ROOT) ===
+    # Estos PDFs están en pdf_storage pero no en latest_map
     for pdf_id, meta in pdf_storage.items():
         # Ocultar temporales de quick-search
         if pdf_id.startswith("temp_"):
