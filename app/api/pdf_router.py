@@ -1266,12 +1266,15 @@ async def global_search(
     total_matches = 0
     for r in rows:
         doc_id = str(r["documento_id"])
+        # ts_rank devuelve NULL si no hay match de FTS (ej. match solo por nombre_archivo ILIKE)
+        score_val = float(r["score"] or 0.0)
+        
         if doc_id not in docs:
             docs[doc_id] = {
                 "pdf_id": doc_id,
                 "filename": r["nombre_archivo"],
                 "total_matches": 0,
-                "score": float(r["score"]),
+                "score": score_val,
                 "results": []
             }
         
@@ -1279,9 +1282,9 @@ async def global_search(
             "page": 1,
             "line": 1,
             "position": 1,
-            "context": r["snippet"],
-            "snippet": r["snippet"],
-            "score": float(r["score"])
+            "context": r["snippet"] or "Coincidencia en nombre de archivo",
+            "snippet": r["snippet"] or "Coincidencia en nombre de archivo",
+            "score": score_val
         })
         docs[doc_id]["total_matches"] += 1
         total_matches += 1
