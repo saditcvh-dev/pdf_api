@@ -4,26 +4,31 @@ from urllib.parse import urlparse, quote_plus, urlunparse
 
 db = None
 if hasattr(settings, "DATABASE_URL") and settings.DATABASE_URL:
-    parsed_url = urlparse(settings.DATABASE_URL)
+    url = settings.DATABASE_URL
+    # La contraseña puede contener #, por lo que urlparse no sirve directamente
+    # Formato: postgresql://user:password@host:port/dbname
     
-    # Si la contraseña tiene caracteres especiales (como #, &), los codificamos
-    if parsed_url.password:
-        encoded_password = quote_plus(parsed_url.password)
+    # 1. Separar scheme "postgresql://" del resto
+    if "://" in url:
+        scheme, rest = url.split("://", 1)
         
-        # Reconstruir la parte "user:password@hostname:port"
-        netloc = f"{parsed_url.username}:{encoded_password}@{parsed_url.hostname}"
-        if parsed_url.port:
-            netloc += f":{parsed_url.port}"
+        # 2. Separar credenciales de host/db usando el último '@'
+        if "@" in rest:
+            creds, host_db = rest.rsplit("@", 1)
             
-        # Generar la nueva URL segura
-        safe_url = urlunparse((
-            parsed_url.scheme,
-            netloc,
-            parsed_url.path,
-            parsed_url.params,
-            parsed_url.query,
-            parsed_url.fragment,
-        ))
-        db = Database(safe_url)
+            # 3. Separar usuario y contraseña usando el primer ':'
+            if ":" in creds:
+                user, password = creds.split(":", 1)
+                
+                # 4. Codificar la contraseña de forma segura
+                encoded_password = quote_plus(password)
+                
+                # 5. Reconstruir URL
+                safe_url = f"{scheme}://{user}:{encoded_password}@{host_db}"
+                db = Database(safe_url)
+            else:
+                db = Database(url)
+        else:
+            db = Database(url)
     else:
-        db = Database(settings.DATABASE_URL)
+        db = Database(url)
