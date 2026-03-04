@@ -60,6 +60,9 @@ class RedisHashDict:
         current.update(update_dict)
         self[key] = current
 
+    def __len__(self) -> int:
+        return redis_client.hlen(self.hash_name)
+
     def items(self):
         all_data = redis_client.hgetall(self.hash_name)
         return [(k, json.loads(v, object_hook=datetime_decoder)) for k, v in all_data.items()]
