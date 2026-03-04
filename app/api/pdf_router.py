@@ -25,6 +25,7 @@ from app.tasks.pdf_tasks import process_pdf_task
 from app.core.celery_app import celery_app
 from app.core.state import pdf_storage, pdf_task_status
 from app.core.config import settings
+from app.core.database import db
 
 # =========================
 # Setup
@@ -1210,78 +1211,50 @@ async def quick_search(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error en búsqueda rápida: {str(e)}")
 
-@router.post("/global-search")
+@router.get("/global-search")
 async def global_search(
     term: str = Query(..., description="Término de búsqueda"),
-    case_sensitive: bool = Query(False, description="Coincidir mayúsculas/minúsculas"),
-    context_chars: int = Query(100, description="Caracteres de contexto alrededor del match"),
-    max_documents: int = Query(100, description="Máximo número de documentos a procesar")
+    limit: int = Query(50, ge=1, le=100),
 ):
-    """
-    Busca en PDFs que cumplen nomenclatura.
-    - Usa texto desde extracted_texts (txt o txt.gz).
-    - Incluye base_id de DOCS_ROOT si DOCS_ROOT existe.
-    """
     start_time = time.time()
-    extracted_dir = Path(settings.EXTRACTED_FOLDER)
 
-    valid_entries = [
-        (pdf_id, meta)
-        for pdf_id, meta in pdf_storage.items()
-        if _name_matches_nomenclature(pdf_id, meta)
-    ][:max_documents]
+    sql = """
+    SELECT
+        id,
+        documento_id,
+        nombre_archivo,
+        ts_rank(texto_ocr_tsv, q) AS score,
+        ts_headline(
+            'spanish',
+            texto_ocr,
+            q,
+            'StartSel=<mark>, StopSel=</mark>, MaxFragments=2, MinWords=5, MaxWords=25'
+        ) AS snippet
+    FROM archivos_digitales,
+         plainto_tsquery('spanish', $1) q
+    WHERE
+        estado_ocr = 'completado'
+        AND texto_ocr_tsv @@ q
+    ORDER BY score DESC
+    LIMIT $2;
+    """
 
-    document_results = []
-
-    for pdf_id, meta in valid_entries:
-        ts = pdf_task_status.get(pdf_id, {})
-
-        text_path = ts.get("extracted_text_path") or meta.get("text_path")
-
-        if not text_path or not os.path.exists(str(text_path)):
-            if _is_base_id(pdf_id):
-                found = _find_canonical_txt(extracted_dir, pdf_id)
-                text_path = str(found) if found else None
-            else:
-                txt_candidate = extracted_dir / f"{pdf_id}.txt"
-                gz_candidate = extracted_dir / f"{pdf_id}.txt.gz"
-                if txt_candidate.exists():
-                    text_path = str(txt_candidate)
-                elif gz_candidate.exists():
-                    text_path = str(gz_candidate)
-                else:
-                    text_path = None
-
-        text = _load_text_from_file(text_path) if text_path else ""
-        if not text:
-            continue
-
-        matches = pdf_service.search_in_text(
-            text,
-            term,
-            case_sensitive=case_sensitive,
-            context_chars=context_chars
-        )
-
-        if matches:
-            filename = meta.get("filename", f"{pdf_id}.pdf")
-            document_results.append({
-                "pdf_id": pdf_id,
-                "filename": filename,
-                "nombre_carpeta": Path(filename).stem,
-                "total_matches": len(matches),
-                "results": matches[:20],
-                "score": sum(r.get("score", 0) for r in matches),
-            })
-
-    document_results.sort(key=lambda x: x["score"], reverse=True)
+    rows = await db.fetch_all(sql, (term, limit))
 
     return {
         "term": term,
-        "total_documents_with_matches": len(document_results),
-        "total_matches": sum(doc["total_matches"] for doc in document_results),
-        "execution_time": time.time() - start_time,
-        "documents": document_results,
+        "total_results": len(rows),
+        "execution_time": round(time.time() - start_time, 3),
+        "results": [
+            {
+                "id": r["id"],
+                "documento_id": r["documento_id"],
+                "nombre_archivo": r["nombre_archivo"],
+                "score": float(r["score"]),
+                "snippet": r["snippet"],
+            }
+            for r in rows
+        ],
     }
 
 @router.get("/{pdf_id}/result")
