@@ -12,6 +12,7 @@ class Settings:
     UPLOAD_FOLDER = os.getenv("UPLOAD_FOLDER", "uploads")
     EXTRACTED_FOLDER = os.getenv("EXTRACTED_FOLDER", "extracted_texts")
     DOCS_ROOT = os.getenv("DOCS_ROOT", "docs")  # Nueva carpeta para PDFs y Textos finales
+    DATABASE_URL = os.getenv("DATABASE_URL", "") # URI de conexión a PostgreSQL
     # --- MODIFICADO POR NICO ---
     # Nueva carpeta centralizada para los PDFs y Textos finales
     OUTPUTS_FOLDER = os.getenv("OUTPUTS_FOLDER", "outputs")
