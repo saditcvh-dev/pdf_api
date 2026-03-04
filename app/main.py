@@ -11,6 +11,8 @@ from pathlib import Path
 from datetime import datetime
 import fitz  # PyMuPDF para contar páginas reales
 
+from app.core.database import db
+
 # Importar los estados globales desde el módulo dedicado
 from app.core.state import pdf_storage, pdf_task_status
 
@@ -109,6 +111,21 @@ def load_existing_pdfs_at_startup():
 
     logger.info(f"Restauración completada: {loaded} PDFs cargados desde disco")
 
+
+@app.on_event("startup")
+async def startup_db():
+    if db:
+        try:
+            await db.connect()
+            logger.info("Conectado a la base de datos PostgreSQL exitosamente.")
+        except Exception as e:
+            logger.error(f"Error conectando a la base de datos: {e}")
+
+@app.on_event("shutdown")
+async def shutdown_db():
+    if db:
+        await db.disconnect()
+        logger.info("Desconectado de la base de datos PostgreSQL.")
 
 @app.on_event("startup")
 def startup_load_pdfs():
