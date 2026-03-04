@@ -1224,47 +1224,77 @@ async def global_search(
     term_cleaned = re.sub(r'[^\w\s]', '', term).strip()
     tokens = [t for t in term_cleaned.split() if t]
     if not tokens:
-        return {"term": term, "total_results": 0, "execution_time": 0, "results": []}
+        return {
+            "term": term, 
+            "total_documents_with_matches": 0, 
+            "total_matches": 0, 
+            "execution_time": 0, 
+            "documents": []
+        }
     
+    # El query string para PostgreSQL Full-Text Search
     tsquery_str = " & ".join(f"{t}:*" for t in tokens)
 
+    # Implementación Hibrida Avanzada (FTS + Trigrams/ILIKE para texto y nombre_archivo)
     sql = """
     SELECT
         id,
         documento_id,
         nombre_archivo,
-        ts_rank(texto_ocr_tsv, q) AS score,
+        ts_rank(texto_ocr_tsv, to_tsquery('spanish', :query)) AS score,
         ts_headline(
-            'spanish',
+            'simple',
             texto_ocr,
-            q,
+            to_tsquery('simple', :query),
             'StartSel=<mark>, StopSel=</mark>, MaxFragments=2, MinWords=5, MaxWords=25'
         ) AS snippet
-    FROM archivos_digitales,
-         to_tsquery('spanish', :query) q
+    FROM archivos_digitales
     WHERE
         estado_ocr = 'completado'
-        AND texto_ocr_tsv @@ q
-    ORDER BY score DESC
+        AND (
+            texto_ocr_tsv @@ to_tsquery('spanish', :query)
+            OR texto_ocr ILIKE '%' || :term_exact || '%'
+            OR nombre_archivo ILIKE '%' || :term_exact || '%'
+        )
+    ORDER BY score DESC NULLS LAST
     LIMIT :limit;
     """
 
-    rows = await db.fetch_all(sql, {"query": tsquery_str, "limit": limit})
+    rows = await db.fetch_all(sql, {"query": tsquery_str, "term_exact": term_cleaned, "limit": limit})
+
+    docs = {}
+    total_matches = 0
+    for r in rows:
+        doc_id = str(r["documento_id"])
+        if doc_id not in docs:
+            docs[doc_id] = {
+                "pdf_id": doc_id,
+                "filename": r["nombre_archivo"],
+                "total_matches": 0,
+                "score": float(r["score"]),
+                "results": []
+            }
+        
+        docs[doc_id]["results"].append({
+            "page": 1,
+            "line": 1,
+            "position": 1,
+            "context": r["snippet"],
+            "snippet": r["snippet"],
+            "score": float(r["score"])
+        })
+        docs[doc_id]["total_matches"] += 1
+        total_matches += 1
+
+    grouped_documents = list(docs.values())
+    grouped_documents.sort(key=lambda x: x["score"], reverse=True)
 
     return {
         "term": term,
-        "total_results": len(rows),
+        "total_documents_with_matches": len(grouped_documents),
+        "total_matches": total_matches,
         "execution_time": round(time.time() - start_time, 3),
-        "results": [
-            {
-                "id": r["id"],
-                "documento_id": r["documento_id"],
-                "nombre_archivo": r["nombre_archivo"],
-                "score": float(r["score"]),
-                "snippet": r["snippet"],
-            }
-            for r in rows
-        ],
+        "documents": grouped_documents
     }
 
 @router.get("/{pdf_id}/result")
