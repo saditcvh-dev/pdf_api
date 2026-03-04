@@ -1235,27 +1235,37 @@ async def global_search(
     # El query string para PostgreSQL Full-Text Search
     tsquery_str = " & ".join(f"{t}:*" for t in tokens)
 
-    # Implementación Hibrida Avanzada (FTS + Trigrams/ILIKE para texto y nombre_archivo)
+    # Implementación Hibrida Avanzada (FTS + Trigrams/ILIKE) con filtrado de versiones recientes
     sql = """
-    SELECT
-        id,
-        documento_id,
-        nombre_archivo,
-        ts_rank(texto_ocr_tsv, to_tsquery('spanish', :query)) AS score,
-        ts_headline(
-            'simple',
-            texto_ocr,
-            to_tsquery('simple', :query),
-            'StartSel=<mark>, StopSel=</mark>, MaxFragments=2, MinWords=5, MaxWords=25'
-        ) AS snippet
-    FROM archivos_digitales
-    WHERE
-        estado_ocr = 'completado'
-        AND (
-            texto_ocr_tsv @@ to_tsquery('spanish', :query)
-            OR texto_ocr ILIKE '%' || :term_exact || '%'
-            OR nombre_archivo ILIKE '%' || :term_exact || '%'
-        )
+    WITH RankedMatches AS (
+        SELECT
+            id,
+            documento_id,
+            nombre_archivo,
+            version_archivo,
+            ts_rank(texto_ocr_tsv, to_tsquery('spanish', :query)) AS score,
+            ts_headline(
+                'simple',
+                texto_ocr,
+                to_tsquery('simple', :query),
+                'StartSel=<mark>, StopSel=</mark>, MaxFragments=2, MinWords=5, MaxWords=25'
+            ) AS snippet
+        FROM archivos_digitales
+        WHERE
+            estado_ocr = 'completado'
+            AND deleted_at IS NULL
+            AND (
+                texto_ocr_tsv @@ to_tsquery('spanish', :query)
+                OR texto_ocr ILIKE '%' || :term_exact || '%'
+                OR nombre_archivo ILIKE '%' || :term_exact || '%'
+            )
+    ),
+    LatestVersions AS (
+        SELECT DISTINCT ON (documento_id) *
+        FROM RankedMatches
+        ORDER BY documento_id, version_archivo DESC
+    )
+    SELECT * FROM LatestVersions
     ORDER BY score DESC NULLS LAST
     LIMIT :limit;
     """
