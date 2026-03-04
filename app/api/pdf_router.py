@@ -1218,6 +1218,16 @@ async def global_search(
 ):
     start_time = time.time()
 
+    # Formatear el query para soportar prefijos (ej: "pre" atrapa "predio")
+    # Limpiamos el texto, separamos por espacios, y agregamos :* a cada palabra
+    # "a b" -> "a:* & b:*"
+    term_cleaned = re.sub(r'[^\w\s]', '', term).strip()
+    tokens = [t for t in term_cleaned.split() if t]
+    if not tokens:
+        return {"term": term, "total_results": 0, "execution_time": 0, "results": []}
+    
+    tsquery_str = " & ".join(f"{t}:*" for t in tokens)
+
     sql = """
     SELECT
         id,
@@ -1231,7 +1241,7 @@ async def global_search(
             'StartSel=<mark>, StopSel=</mark>, MaxFragments=2, MinWords=5, MaxWords=25'
         ) AS snippet
     FROM archivos_digitales,
-         plainto_tsquery('spanish', :term) q
+         to_tsquery('spanish', :query) q
     WHERE
         estado_ocr = 'completado'
         AND texto_ocr_tsv @@ q
@@ -1239,7 +1249,7 @@ async def global_search(
     LIMIT :limit;
     """
 
-    rows = await db.fetch_all(sql, {"term": term, "limit": limit})
+    rows = await db.fetch_all(sql, {"query": tsquery_str, "limit": limit})
 
     return {
         "term": term,
