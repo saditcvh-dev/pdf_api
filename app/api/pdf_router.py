@@ -936,29 +936,55 @@ async def merge_with_output(
             position=position,
         )
 
-        pdf_storage[merged_id] = {
-            "filename": f"{merged_id}.pdf",
-            "pdf_path": merged_path,
-            "size": os.path.getsize(merged_path),
-            "upload_time": time.time(),
-            "mode": "local",
-            "task_id": None,
-        }
-        pdf_task_status[merged_id] = {
-            "task_id": None,
-            "status": "completed",
-            "created_at": now,
-            "completed_at": datetime.now(),
-            "pages": pages,
-            "extracted_text_path": None,
-            "ocr_pdf_path": merged_path,
-            "used_ocr": True,
-            "mode": "local",
-            "error": None,
-            "progress": 100,
-        }
+        # Actualizamos el registro del primer PDF en cache
+        original_filename = first_path.name
+        if first_pdf_id in pdf_storage:
+            original_filename = pdf_storage[first_pdf_id].get("filename", first_path.name)
+            pdf_storage[first_pdf_id].update({
+                "pdf_path": merged_path,
+                "size": os.path.getsize(merged_path),
+                "upload_time": time.time(),
+                "mode": "local",
+                "task_id": None,
+            })
+        else:
+            # Si por alguna razón no estaba, lo agregamos (fallback)
+            pdf_storage[first_pdf_id] = {
+                "filename": original_filename,
+                "pdf_path": merged_path,
+                "size": os.path.getsize(merged_path),
+                "upload_time": time.time(),
+                "mode": "local",
+                "task_id": None,
+            }
 
-        return FileResponse(merged_path, media_type="application/pdf", filename=f"{merged_id}.pdf")
+        # Actualizamos también el task status
+        if first_pdf_id in pdf_task_status:
+            pdf_task_status[first_pdf_id].update({
+                "status": "completed",
+                "completed_at": datetime.now(),
+                "ocr_pdf_path": merged_path,
+                "used_ocr": True,
+                "mode": "local",
+                "error": None,
+                "progress": 100,
+            })
+        else:
+            pdf_task_status[first_pdf_id] = {
+                "task_id": None,
+                "status": "completed",
+                "created_at": now,
+                "completed_at": datetime.now(),
+                "pages": pages,
+                "extracted_text_path": None,
+                "ocr_pdf_path": merged_path,
+                "used_ocr": True,
+                "mode": "local",
+                "error": None,
+                "progress": 100,
+            }
+
+        return FileResponse(merged_path, media_type="application/pdf", filename=original_filename)
 
     except HTTPException:
         raise
