@@ -1022,7 +1022,10 @@ async def merge_with_output(
         raise HTTPException(status_code=500, detail=f"Error en merge: {str(e)}")
 
 @router.get("/list", response_model=PDFListResponse)
-async def list_pdfs():
+async def list_pdfs(
+    page: int = Query(1, ge=1, description="Número de página para la lista"),
+    limit: int = Query(50, ge=1, le=500, description="Cantidad de PDFs por página")
+):
     """
     LISTA DESDE CACHÉ EN MEMORIA.
     Ya no escanea DOCS_ROOT en cada llamada, depende de pdf_storage cargado al inicio.
@@ -1128,11 +1131,21 @@ async def list_pdfs():
         "with_ocr": len(by_status_lists["with_ocr"])
     }
 
+    total = len(pdfs_list)
+    total_pages = (total + limit - 1) // limit if limit > 0 else 1
+
+    start_idx = (page - 1) * limit
+    end_idx = start_idx + limit
+    paginated_pdfs = pdfs_list[start_idx:end_idx]
+
     return {
-        "total": len(pdfs_list),
+        "total": total,
+        "page": page,
+        "limit": limit,
+        "total_pages": total_pages,
         "by_status": by_status_counts,
-        "pdfs": pdfs_list,
-        "summary": by_status_lists
+        "pdfs": paginated_pdfs,
+        "summary": {}
     }
 @router.get("/dashboard")
 async def get_dashboard():
